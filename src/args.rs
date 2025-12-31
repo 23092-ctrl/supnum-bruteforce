@@ -1,6 +1,5 @@
 use clap::Parser;
 
-
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct SupArgs {
@@ -8,18 +7,20 @@ pub struct SupArgs {
     pub target: String,
 
     #[arg(short, long)]
-    pub user: String,
+    pub service: String,
+
+    #[arg(short, long)]
+    pub user: Option<String>,
+
+    #[arg(short, long)]
+    pub userlist: Option<String>, // La virgule ici est obligatoire
 
     #[arg(short, long)]
     pub wordlist: String,
 
-    #[arg(short, long)]
-    pub service: String,
-
-    #[arg(short, long, default_value_t = 10)]
+    #[arg(short, long, default_value_t = 4)]
     pub threads: usize,
 
-    // Nouvel argument pour le port
     #[arg(short, long)]
     pub port: Option<u16>,
 
