@@ -211,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
            if ok {
                 println!("\n{}", "====================================================".green());
                 println!("{} SUCCÈS TROUVÉ !", "[+]".green().bold());
-                println!("{} Utilisateur : {}", " > ".green(), u.bold()); // Changé 'user' par 'u'
+                println!("{} Utilisateur : {}", " > ".green(), u.bold()); 
                 println!("{} Mot de passe : {}", " > ".green(), password.yellow().bold());
                 println!("{}\n", "====================================================".green());
                 std::process::exit(0); 
