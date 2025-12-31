@@ -5,17 +5,16 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", features = ["json", "native-tls"] }
 ssh2 = "0.9"
-clap = { version = "4.0", features = ["derive"] }
+reqwest = { version = "0.11", features = ["json"] }
+suppaftp = { version = "5.0", features = ["async"] }
 anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
 colored = "2.0"
-suppaftp = { version = "5.0", features = ["async", "native-tls"] }
-sqlx = { version = "0.7", features = ["runtime-tokio", "mysql", "postgres", "tls-native-tls"] }
-redis = { version = "0.23", features = ["tokio-comp"] }
-mongodb = "2.7"
 base64 = "0.21"
 native-tls = "0.2"
 tokio-native-tls = "0.3"
-# On retire les features problématiques, ldap3 gérera ses propres dépendances
+rand = "0.8"
+mongodb = "2.0"
+sqlx = { version = "0.7", features = ["mysql", "postgres", "runtime-tokio-native-tls"] }
 ldap3 = "0.11"
