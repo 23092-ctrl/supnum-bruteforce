@@ -20,7 +20,21 @@ use tokio::time::{timeout, Duration};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // --- UTILITAIRES RÉSEAU ---
-
+//exreaction du nom
+async fn extract_name(line: &str) -> Option<String> {
+    if let Some(pos) = line.find("name=\"") {
+        let start = pos + 6;
+        if let Some(end) = line[start..].find("\"") {
+            return Some(line[start..start+end].to_string());
+        }
+    } else if let Some(pos) = line.find("name='") {
+        let start = pos + 6;
+        if let Some(end) = line[start..].find("'") {
+            return Some(line[start..start+end].to_string());
+        }
+    }
+    None
+}
 async fn connect_tls(host: &str, port: u16) -> Option<tokio_native_tls::TlsStream<tokio::net::TcpStream>> {
     let addr = format!("{}:{}", host, port);
     let connector = TlsConnector::builder().danger_accept_invalid_certs(true).build().ok()?;
