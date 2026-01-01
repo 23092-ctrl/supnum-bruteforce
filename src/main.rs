@@ -19,7 +19,7 @@ use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-// --- UTILITAIRES RÉSEAU ---
+
 //exreaction du nom
 async fn extract_name(line: &str) -> Option<String> {
     if let Some(pos) = line.find("name=\"") {
@@ -35,6 +35,7 @@ async fn extract_name(line: &str) -> Option<String> {
     }
     None
 }
+// --- UTILITAIRES RÉSEAU ---
 async fn connect_tls(host: &str, port: u16) -> Option<tokio_native_tls::TlsStream<tokio::net::TcpStream>> {
     let addr = format!("{}:{}", host, port);
     let connector = TlsConnector::builder().danger_accept_invalid_certs(true).build().ok()?;
@@ -49,43 +50,45 @@ async fn attempt_ssh(host: &str, port: u16, user: &str, pass: &str) -> bool {
     let u = user.trim().to_string();
     let p = pass.trim().to_string();
 
-    let result: Option<bool> = tokio::task::spawn_blocking(move || {
-        // Connexion TCP
-        let stream = match std::net::TcpStream::connect_timeout(
-            &addr.parse().ok()?,
-            std::time::Duration::from_secs(5)
-        ) {
-            Ok(s) => s,
-            Err(_) => return None,
+    let result = tokio::task::spawn_blocking(move || {
+        // 1. Parsing de l'adresse et connexion TCP
+        let socket_addr = match addr.parse::<std::net::SocketAddr>() {
+            Ok(a) => a,
+            Err(_) => return false,
         };
 
-        // Création de la session
+        let stream = match std::net::TcpStream::connect_timeout(
+            &socket_addr, 
+            std::time::Duration::from_secs(1)
+        ) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        // 2. Initialisation de la session
         let mut sess = match Session::new() {
             Ok(s) => s,
-            Err(_) => return None,
+            Err(_) => return false,
         };
 
         sess.set_tcp_stream(stream);
-        sess.set_timeout(5000);
+        // sess.set_timeout(5000);
 
-        // Handshake
+        // 3. Handshake
         if sess.handshake().is_err() {
-            return None;
+            return false;
         }
 
-        // Authentification
-        let auth_result = sess.userauth_password(&u, &p);
-        let authenticated = sess.authenticated();
-
-        // Déconnexion
-        let _ = sess.disconnect(None, "Finished", None);
-
-        Some(auth_result.is_ok() && authenticated)
-    }).await.ok().flatten();
+        // 4. Authentification
+        match sess.userauth_password(&u, &p) {
+            Ok(_) => sess.authenticated(),
+            Err(_) => false,
+        }
+    }).await;
 
     result.unwrap_or(false)
 }
-
+   
         
 
 async fn attempt_smb(host: &str, user: &str, pass: &str) -> bool {
