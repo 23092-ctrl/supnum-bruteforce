@@ -24,3 +24,4 @@ pub fn show(name: &str, github: &str) {
     println!("{}", "------------------------------------------------------------".bright_black());
     println!();
 }
+
