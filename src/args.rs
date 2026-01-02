@@ -6,7 +6,7 @@ use clap::Parser;
 #[command(version = "1.0")]
 #[command(about = "Multi-service bruteforce tool with advanced HTTP selectors", long_about = None)]
 pub struct SupArgs {
-    /// Cible (IP ou URL)
+    /// Cible (IP ,host ou URL)
     #[arg(short, long)]
     pub target: String,
 
@@ -27,8 +27,8 @@ pub struct SupArgs {
     pub port: Option<u16>,
 
     /// Délai entre les tentatives en millisecondes
-    #[arg(short, long, default_value_t = 0)]
-    pub delay: u64,
+    // #[arg(short, long, default_value_t = 0)]
+    // pub delay: u64,
 
     /// Message d'erreur à chercher (Succès si absent)
     #[arg(short, long)]
@@ -48,10 +48,7 @@ pub struct SupArgs {
     #[arg(long, num_args = 2, value_names = ["USER_NAME", "PASS_NAME"])]
     pub names: Option<Vec<String>>,
 
-    /// IDs des champs HTML (ex: --ids login_id pass_id)
-    #[arg(long, num_args = 2, value_names = ["USER_ID", "PASS_ID"])]
-    pub ids: Option<Vec<String>>,
-
+  
     /// Types des champs HTML (ex: --types text password)
     #[arg(long, num_args = 2, value_names = ["USER_TYPE", "PASS_TYPE"])]
     pub types: Option<Vec<String>>,
