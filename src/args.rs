@@ -1,7 +1,7 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "SupNum Bruteforcer")]
+#[command(name = "SupNum Bruteforce")]
 #[command(author = "Cheikh ELghadi")]
 #[command(version = "1.0")]
 #[command(about = "Multi-service bruteforce tool with advanced HTTP selectors", long_about = None)]
@@ -10,11 +10,11 @@ pub struct SupArgs {
     #[arg(short, long)]
     pub target: String,
 
-    /// Service (ssh, ftp, http, mysql, etc.)
+ 
     #[arg(short, long, default_value = "http")]
     pub service: String,
 
-    /// Chemin vers la wordlist
+  
     #[arg(short, long)]
     pub wordlist: String,
 
@@ -25,10 +25,6 @@ pub struct SupArgs {
     /// Port (optionnel, utilise le port par défaut du service sinon)
     #[arg(short, long)]
     pub port: Option<u16>,
-
-    /// Délai entre les tentatives en millisecondes
-    // #[arg(short, long, default_value_t = 0)]
-    // pub delay: u64,
 
     /// Message d'erreur à chercher (Succès si absent)
     #[arg(short, long)]
@@ -42,8 +38,6 @@ pub struct SupArgs {
     #[arg(long)]
     pub password: Option<String>,
 
-    // --- NOUVEAUX ARGUMENTS POUR LE CONTRÔLE DES INPUTS ---
-
     /// Noms des champs HTML (ex: --names username password)
     #[arg(long, num_args = 2, value_names = ["USER_NAME", "PASS_NAME"])]
     pub names: Option<Vec<String>>,
@@ -52,4 +46,6 @@ pub struct SupArgs {
     /// Types des champs HTML (ex: --types text password)
     #[arg(long, num_args = 2, value_names = ["USER_TYPE", "PASS_TYPE"])]
     pub types: Option<Vec<String>>,
+    #[arg(long)]
+    pub init: bool,
 }
