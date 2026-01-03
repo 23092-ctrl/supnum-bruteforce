@@ -460,7 +460,7 @@ else if let Some(ref types) = args.types {
             let _ = std::fs::write(cache_file, current_line.to_string());
         }
 
-        // ... (Le reste de ton code de parsing et spawn reste identique) ...
+      
         let (u, p) = if raw_line.contains(':') {
             let parts: Vec<&str> = raw_line.splitn(2, ':').collect();
             (parts[0].to_string(), parts[1].to_string())
