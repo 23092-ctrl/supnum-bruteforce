@@ -3,6 +3,7 @@ mod header;
 
 use args::SupArgs;
 use clap::Parser;
+use sqlx::{Connection, MySqlConnection};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::fs::File;
@@ -155,9 +156,20 @@ async fn attempt_imap(host: &str, port: u16, user: &str, pass: &str) -> bool {
     false
 }
 
+
+
 async fn attempt_mysql(host: &str, port: u16, user: &str, pass: &str) -> bool {
     let url = format!("mysql://{}:{}@{}:{}", user, pass, host, port);
-    timeout(Duration::from_secs(3), sqlx::MySqlPool::connect(&url)).await.is_ok()
+    
+   
+    match timeout(Duration::from_secs(3), MySqlConnection::connect(&url)).await {
+        Ok(Ok(mut conn)) => {
+          
+            let _ = conn.close().await; 
+            true
+        }
+        _ => false, 
+    }
 }
 
 async fn attempt_postgres(host: &str, port: u16, user: &str, pass: &str) -> bool {
@@ -460,7 +472,7 @@ else if let Some(ref types) = args.types {
             let _ = std::fs::write(cache_file, current_line.to_string());
         }
 
-      
+        // ... (Le reste de ton code de parsing et spawn reste identique) ...
         let (u, p) = if raw_line.contains(':') {
             let parts: Vec<&str> = raw_line.splitn(2, ':').collect();
             (parts[0].to_string(), parts[1].to_string())
