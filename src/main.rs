@@ -255,11 +255,9 @@ async fn attempt_http(
     p_selector: &str  
 ) -> bool {
     
-    let url = if target.starts_with("https://") || target.starts_with("http://") {
-      
+    let url = if target.starts_with("http") {
         target.to_string()
     } else {
-       
         let proto = if port == 443 { "https" } else { "http" };
         format!("{}://{}:{}", proto, target, port)
     };
@@ -268,14 +266,13 @@ async fn attempt_http(
     let mut final_p_field = p_selector.to_string();
     let mut use_get = false;
 
-  
+    // --- ÉTAPE A : ANALYSE ---
     if let Ok(resp) = client.get(&url).send().await {
         if let Ok(html) = resp.text().await {
             let html_low = html.to_lowercase();
             if html_low.contains("method=\"get\"") || html_low.contains("method='get'") {
                 use_get = true;
             }
-
             if let Some(found_u) = find_name_by_type(&html, u_selector) {
                 final_u_field = found_u;
             }
@@ -291,26 +288,39 @@ async fn attempt_http(
         (final_p_field.trim(), pass.trim())
     ];
 
-    // --- ÉTAPE C : ENVOI ---
+  
     let request = if use_get {
         client.get(&url).query(&params)
     } else {
         client.post(&url).form(&params)
     };
+  //ETAPE C: envoi
+    match request.send().await {
+        Ok(res) => {
+          
+            if res.status().is_redirection() { 
+                return true; 
+            }
 
-    let res = request.send().await;
-
-    if let Ok(r) = res {
-        // Succès si redirection (301, 302)
-        if r.status().is_redirection() { return true; }
-        
-        
-        if let Some(msg) = error_msg {
-            if let Ok(text) = r.text().await {
-                if !text.to_lowercase().contains(&msg.to_lowercase()) { return true; }
+            
+            if let Some(msg) = error_msg {
+                
+                if let Ok(text) = res.text().await {
+                    let text_low = text.to_lowercase();
+                    let msg_low = msg.to_lowercase();
+                  
+                    if !text_low.contains(&msg_low) { 
+                        return true; 
+                    }
+                }
+            } else {
+               
+                return res.status().is_success();
             }
         }
+        Err(_) => return false,
     }
+
     false
 }
 
