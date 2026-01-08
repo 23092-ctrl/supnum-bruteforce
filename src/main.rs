@@ -65,7 +65,7 @@ async fn attempt_ssh(host: &str, port: u16, user: &str, pass: &str) -> bool {
         // Connexion TCP
         let stream = match std::net::TcpStream::connect_timeout(
             &addr.parse().ok()?,
-            std::time::Duration::from_secs(5)
+            std::time::Duration::from_secs(3)
         ) {
             Ok(s) => s,
             Err(_) => return None,
@@ -240,10 +240,6 @@ fn find_name_by_type(html: &str, target_type: &str) -> Option<String> {
     }
     None
 }
-
-
-
- // --- MODULES DE CONNEXION ---
 async fn attempt_http(
     client: &reqwest::Client,
     target: &str,
@@ -261,10 +257,7 @@ async fn attempt_http(
         format!("{}://{}:{}", proto, target, port)
     };
 
-    let params = [
-        (u_selector.trim(), user.trim()),
-        (p_selector.trim(), pass.trim()),
-    ];
+    let params = [(u_selector.trim(), user.trim()), (p_selector.trim(), pass.trim())];
 
     let res = match client.post(&url).form(&params).send().await {
         Ok(r) => r,
@@ -272,19 +265,8 @@ async fn attempt_http(
     };
 
     let status = res.status();
-    
-    // Détection du type de contenu (JSON ou HTML)
-    let content_type = res.headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_lowercase();
-
-    let redirect_url = res.headers()
-        .get("location")
-        .and_then(|l| l.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+    let content_type = res.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
+    let redirect_url = res.headers().get("location").and_then(|l| l.to_str().ok()).map(|s| s.to_string()).unwrap_or_default();
 
     let body = res.text().await.unwrap_or_default();
     let body_low = body.to_lowercase();
@@ -295,59 +277,43 @@ async fn attempt_http(
         false
     };
 
-    // -------------------------------------------------
-    // CAS 1 : RÉPONSE JSON (API / JS)
-    // -------------------------------------------------
+
     if content_type.contains("application/json") {
-        // En JSON, si le status est 2xx et qu'il n'y a pas d'erreur, on cherche des preuves de succès
         if status.is_success() && !error_found {
-            // Heuristiques de succès JSON
-            if body_low.contains("\"success\":true") 
-                || body_low.contains("\"authenticated\":true")
-                || body_low.contains("\"token\"")
-                || body_low.contains("\"access_token\"") 
-            {
+            let success_indicators = ["\"success\":true", "\"authenticated\":true", "\"token\"", "\"access_token\""];
+            if success_indicators.iter().any(|&s| body_low.contains(s)) {
                 return true;
             }
-            
-            // Si le message d'erreur est explicitement absent du JSON (ex: "incorrect" n'y est pas)
-            if let Some(msg) = error_msg {
-                if !body_low.contains(&msg.to_lowercase()) {
-                    return true;
-                }
+           
+            if error_msg.is_some() && !error_found {
+                return true;
             }
         }
         return false;
     }
 
+    // --- 2. CAS HTML ---
     let u_pattern = format!("name=\"{}\"", u_selector.to_lowercase());
     let p_pattern = format!("name=\"{}\"", p_selector.to_lowercase());
     let inputs_present = body_low.contains(&u_pattern) || body_low.contains(&p_pattern);
 
-    // 1. Redirection vers ailleurs (Succès)
+    // Redirection
     if status.is_redirection() && !redirect_url.is_empty() {
-        let redirect_low = redirect_url.to_lowercase();
-        // On évite de boucler sur le login
-        if redirect_low == url.to_lowercase() || redirect_low.ends_with("/login") {
-            return false;
-        }
+        let red_low = redirect_url.to_lowercase();
+        let is_login_page = red_low == url.to_lowercase() || red_low.contains("/login");
+        if is_login_page { return false; }
         return !error_found;
     }
 
-    // 2. Disparition des inputs ou du message d'erreur (Succès)
-    if status.is_success() {
-        if !error_found && !inputs_present {
-            return true;
-        }
-    }
-
-    // 3. Critère de sécurité final
-    if !inputs_present && !error_found && !status.is_server_error() {
+    // Succès 200 OK
+    if status.is_success() && !error_found && !inputs_present {
         return true;
     }
 
-    false
+    // Sécurité finale
+    !inputs_present && !error_found && !status.is_server_error()
 }
+  
 async fn attempt_vnc(host: &str, port: u16, pass: &str) -> bool {
     let addr = format!("{}:{}", host, port);
     
@@ -377,6 +343,7 @@ async fn attempt_vnc(host: &str, port: u16, pass: &str) -> bool {
    
     true 
 }
+
 // --- MOTEUR PRINCIPAL ---
 
 
@@ -506,19 +473,27 @@ else if let Some(ref types) = args.types {
             let _ = std::fs::write(cache_file, current_line.to_string());
         }
 
-        // ... (Le reste de ton code de parsing et spawn reste identique) ...
-        let (u, p) = if raw_line.contains(':') {
-            let parts: Vec<&str> = raw_line.splitn(2, ':').collect();
-            (parts[0].to_string(), parts[1].to_string())
-        } else if let Some(ref fixed_user) = args.user {
-            (fixed_user.clone(), raw_line)
-        } else if let Some(ref fixed_pass) = args.password {
-            (raw_line, fixed_pass.clone())
-        } else {
-            (raw_line.clone(), raw_line.clone())
-        };
-
-        // Clonage des variables pour le thread
+ 
+      let (u, p) = if let (Some(fixed_user), Some(fixed_pass)) = (&args.user, &args.password) {
+  
+    (fixed_user.clone(), fixed_pass.clone())
+} else if let Some(fixed_user) = &args.user {
+    
+    (fixed_user.clone(), raw_line)
+} else if let Some(fixed_pass) = &args.password {
+    
+    (raw_line, fixed_pass.clone())
+} else {
+    
+    if raw_line.contains(':') {
+        let parts: Vec<&str> = raw_line.splitn(2, ':').collect();
+        (parts[0].to_string(), parts[1].to_string())
+    } else {
+       
+        (raw_line.clone(), raw_line.clone())
+    }
+};
+       
         let t_u = u; let t_p = p;
         let t_host = host_only.clone();
         let t_url = input_target.to_string(); 
