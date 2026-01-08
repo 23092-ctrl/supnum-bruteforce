@@ -245,16 +245,15 @@ fn find_name_by_type(html: &str, target_type: &str) -> Option<String> {
 
  // --- MODULES DE CONNEXION ---
 async fn attempt_http(
-    client: &Client, 
-    target: &str, 
-    port: u16, 
-    user: &str, 
-    pass: &str, 
+    client: &reqwest::Client,
+    target: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
     error_msg: &Option<String>,
-    u_selector: &str, 
-    p_selector: &str  
+    u_selector: &str,
+    p_selector: &str,
 ) -> bool {
-    
     let url = if target.starts_with("http") {
         target.to_string()
     } else {
@@ -262,68 +261,93 @@ async fn attempt_http(
         format!("{}://{}:{}", proto, target, port)
     };
 
-    let mut final_u_field = u_selector.to_string();
-    let mut final_p_field = p_selector.to_string();
-    let mut use_get = false;
+    let params = [
+        (u_selector.trim(), user.trim()),
+        (p_selector.trim(), pass.trim()),
+    ];
 
-    // --- ÉTAPE A : ANALYSE ---
-    if let Ok(resp) = client.get(&url).send().await {
-        if let Ok(html) = resp.text().await {
-            let html_low = html.to_lowercase();
-            if html_low.contains("method=\"get\"") || html_low.contains("method='get'") {
-                use_get = true;
+    let res = match client.post(&url).form(&params).send().await {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+
+    let status = res.status();
+    
+    // Détection du type de contenu (JSON ou HTML)
+    let content_type = res.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let redirect_url = res.headers()
+        .get("location")
+        .and_then(|l| l.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    let body = res.text().await.unwrap_or_default();
+    let body_low = body.to_lowercase();
+
+    let error_found = if let Some(msg) = error_msg {
+        body_low.contains(&msg.to_lowercase())
+    } else {
+        false
+    };
+
+    // -------------------------------------------------
+    // CAS 1 : RÉPONSE JSON (API / JS)
+    // -------------------------------------------------
+    if content_type.contains("application/json") {
+        // En JSON, si le status est 2xx et qu'il n'y a pas d'erreur, on cherche des preuves de succès
+        if status.is_success() && !error_found {
+            // Heuristiques de succès JSON
+            if body_low.contains("\"success\":true") 
+                || body_low.contains("\"authenticated\":true")
+                || body_low.contains("\"token\"")
+                || body_low.contains("\"access_token\"") 
+            {
+                return true;
             }
-            if let Some(found_u) = find_name_by_type(&html, u_selector) {
-                final_u_field = found_u;
+            
+            // Si le message d'erreur est explicitement absent du JSON (ex: "incorrect" n'y est pas)
+            if let Some(msg) = error_msg {
+                if !body_low.contains(&msg.to_lowercase()) {
+                    return true;
+                }
             }
-            if let Some(found_p) = find_name_by_type(&html, p_selector) {
-                final_p_field = found_p;
-            }
+        }
+        return false;
+    }
+
+    let u_pattern = format!("name=\"{}\"", u_selector.to_lowercase());
+    let p_pattern = format!("name=\"{}\"", p_selector.to_lowercase());
+    let inputs_present = body_low.contains(&u_pattern) || body_low.contains(&p_pattern);
+
+    // 1. Redirection vers ailleurs (Succès)
+    if status.is_redirection() && !redirect_url.is_empty() {
+        let redirect_low = redirect_url.to_lowercase();
+        // On évite de boucler sur le login
+        if redirect_low == url.to_lowercase() || redirect_low.ends_with("/login") {
+            return false;
+        }
+        return !error_found;
+    }
+
+    // 2. Disparition des inputs ou du message d'erreur (Succès)
+    if status.is_success() {
+        if !error_found && !inputs_present {
+            return true;
         }
     }
 
-    // --- ÉTAPE B : PARAMÈTRES ---
-    let params = [
-        (final_u_field.trim(), user.trim()), 
-        (final_p_field.trim(), pass.trim())
-    ];
-
-  
-    let request = if use_get {
-        client.get(&url).query(&params)
-    } else {
-        client.post(&url).form(&params)
-    };
-  //ETAPE C: envoi
-    match request.send().await {
-        Ok(res) => {
-          
-            if res.status().is_redirection() { 
-                return true; 
-            }
-
-            
-            if let Some(msg) = error_msg {
-                
-                if let Ok(text) = res.text().await {
-                    let text_low = text.to_lowercase();
-                    let msg_low = msg.to_lowercase();
-                  
-                    if !text_low.contains(&msg_low) { 
-                        return true; 
-                    }
-                }
-            } else {
-               
-                return res.status().is_success();
-            }
-        }
-        Err(_) => return false,
+    // 3. Critère de sécurité final
+    if !inputs_present && !error_found && !status.is_server_error() {
+        return true;
     }
 
     false
 }
-
 async fn attempt_vnc(host: &str, port: u16, pass: &str) -> bool {
     let addr = format!("{}:{}", host, port);
     
