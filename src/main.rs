@@ -420,9 +420,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if start_line > 0 { println!("{} Reprise à la ligne : {}", "[*]".cyan(), start_line); }
     }
 
-    println!("[*] Cible   : {}", host_only.cyan());
+    println!("[*] Cible   : {}", host_only.bright_green().bold());
+    println!("{} SERVICE : {}", "[*]".yellow(), t_service_lower.as_str().bright_cyan().bold());
     println!("------------------------------------------------------------");
-
+  
     let t_delay = args.delay; 
     let mut current_line = 0;
   
@@ -519,7 +520,7 @@ if t_service_lower == "ftp" || t_service_lower == "smb" {
             if ok && !t_success.swap(true, Ordering::SeqCst) {
                 let _ = std::fs::remove_file(&t_cache_name); 
                 println!("\n\n{}", "====================================================".green().bold());
-                println!("{} SERVICE : {}", ">".cyan().bold(), t_service.as_str().bright_blue().bold());
+              
                 println!("{} SUCCÈS TROUVÉ !", "[+]".green().bold());
                 println!("{} UTILISATEUR : {}", " >".cyan(), t_u.bright_white().bold());
                 println!("{} MOT DE PASSE : {}", " >".cyan(), t_p.bright_yellow().bold());
