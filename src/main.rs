@@ -1,6 +1,5 @@
 mod args;
 mod header;
-
 use args::SupArgs;
 use clap::Parser;
 use sqlx::{Connection, MySqlConnection};
@@ -9,7 +8,9 @@ use tokio::sync::Semaphore;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt, BufReader};
 use colored::*;
-use ssh2::Session;
+use russh::*;
+use russh_keys::*;
+use async_trait::async_trait;
 use suppaftp::AsyncFtpStream;
 use base64::{engine::general_purpose, Engine as _};
 use native_tls::TlsConnector;
@@ -20,6 +21,19 @@ use tokio::time::{timeout, Duration};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpStream;
 use std::io::{self, Write};
+async fn check_anonymous(service: &str, host: &str, port: u16) -> bool {
+    match service {
+        "ftp" => {
+            let addr = format!("{}:{}", host, port);
+            if let Ok(Ok(mut ftp)) = timeout(Duration::from_secs(4), AsyncFtpStream::connect(addr)).await {
+                let res = ftp.login("anonymous", "anonymous").await.is_ok();
+                let _ = ftp.quit().await; res
+            } else { false }
+        },
+        "smb" => attempt_smb(host, "anonymous", "anonymous").await,
+        _ => false,
+    }
+}
 async fn detect_service(target: &str, port: u16) -> String {
     let addr = format!("{}:{}", target, port);
     let stream = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(&addr)).await;
@@ -53,41 +67,56 @@ async fn connect_tls(host: &str, port: u16) -> Option<tokio_native_tls::TlsStrea
     tokio_connector.connect(host, stream).await.ok()
 }
 
-// --- MODULES DE CONNEXION ---
-async fn attempt_ssh(host: &str, port: u16, user: &str, pass: &str) -> bool {
-    let addr = format!("{}:{}", host, port);
-    let u = user.trim().to_string();
-    let p = pass.trim().to_string();
 
-    let result: Option<bool> = tokio::task::spawn_blocking(move || {
-        let stream = match std::net::TcpStream::connect_timeout(
-            &addr.parse().ok()?,
-            std::time::Duration::from_secs(3)
-        ) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
 
-        let mut sess = match Session::new() {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
+struct Client;
 
-        sess.set_tcp_stream(stream);
-        sess.set_timeout(5000);
+#[async_trait]
+impl client::Handler for Client {
+    type Error = russh::Error;
 
-        if sess.handshake().is_err() { return None; }
-
-        let auth_result = sess.userauth_password(&u, &p);
-        let authenticated = sess.authenticated();
-        let _ = sess.disconnect(None, "Finished", None);
-
-        Some(auth_result.is_ok() && authenticated)
-    }).await.ok().flatten();
-
-    result.unwrap_or(false)
+    async fn check_server_key(self, _server_public_key: &key::PublicKey) -> Result<(Self, bool), Self::Error> {
+        Ok((self, true))
+    }
 }
 
+
+
+async fn attempt_ssh_async(host: &str, port: u16, user: &str, pass: &str) -> bool {
+    let config = Arc::new(client::Config::default());
+    let sh = Client;
+    let addr = format!("{}:{}", host, port);
+
+    // 1. Connexion avec timeout strict
+    let connect_res = tokio::time::timeout(
+        std::time::Duration::from_secs(4), // Temps pour ouvrir le port et Handshake
+        client::connect(config, addr, sh)
+    ).await;
+
+    match connect_res {
+        Ok(Ok(mut session)) => {
+            // 2. Authentification avec un timeout dédié
+            let auth_res = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                session.authenticate_password(user, pass)
+            ).await;
+
+            match auth_res {
+                Ok(Ok(success)) => {
+                    // 3. Fermeture propre (très important pour l'efficacité)
+                    let _ = session.disconnect(Disconnect::ByApplication, "", "");
+                    success
+                },
+                _ => false, 
+            }
+        },
+        Ok(Err(e)) => {
+           
+            false
+        }
+        Err(_) => false,
+    }
+}
 async fn attempt_smb(host: &str, user: &str, pass: &str) -> bool {
     let share = format!("//{}//IPC$", host);
     let user_pass = format!("{}%{}", user.trim(), pass.trim());
@@ -366,57 +395,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-if t_service_lower == "ftp" {
-    println!("{} Vérification de l'accès FTP anonyme...", "[*]".yellow());
-    let addr = format!("{}:{}", host_only, port_to_use);
-    let is_anon = if let Ok(Ok(mut ftp)) = timeout(Duration::from_secs(4), AsyncFtpStream::connect(addr)).await {
-        let res = ftp.login("anonymous", "anonymous").await.is_ok();
-        let _ = ftp.quit().await; 
-        res
-    } else { false };
 
-    if is_anon {
-        println!("\n{}", "====================================================".green().bold());
-        println!("{} ACCÈS FTP ANONYME DÉTECTÉ !", "[!]".green().bold());
-        println!("{} Identifiants : anonymous / anonymous", " >".cyan());
-        println!("{}", "====================================================".green().bold());
-        
-        print!("{} Voulez-vous quand même continuer le bruteforce ? (y/N): ", "[?]".yellow());
-        io::stdout().flush().unwrap();
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer).unwrap();
-        if answer.trim().to_lowercase() != "y" {
-            return Ok(());
-        }
-        println!("{} Continuation du bruteforce...", "[*]".cyan());
-    }
-}
 
-// --- LOGIQUE SMB ANONYME ---
-if t_service_lower == "smb" {
-    println!("{} Vérification de l'accès SMB anonyme...", "[*]".yellow());
-    if attempt_smb(&host_only, "anonymous", "anonymous").await {
-        println!("\n{}", "====================================================".green().bold());
-        println!("{} ACCÈS SMB ANONYME DÉTECTÉ !", "[!]".green().bold());
-        println!("{} Identifiants : anonymous / anonymous", " >".cyan());
-        println!("{}", "====================================================".green().bold());
-        
-        print!("{} Voulez-vous quand même continuer le bruteforce ? (y/N): ", "[?]".yellow());
-        io::stdout().flush().unwrap();
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer).unwrap();
-        if answer.trim().to_lowercase() != "y" {
-            return Ok(());
-        }
-        println!("{} Continuation du bruteforce...", "[*]".cyan());
-    }
-}
  
     let f_dict = File::open(&args.wordlist).await?;
     let mut lines = BufReader::new(f_dict).lines();
     let mut set = JoinSet::new();
 
-    // CACHE DYNAMIQUE UNIQUE
     let target_user = args.user.as_deref().unwrap_or("multi");
     let cache_file = format!(".supnum_cache_{}_{}_{}", 
         host_only.replace(".", "_"), 
@@ -440,6 +425,34 @@ if t_service_lower == "smb" {
 
     let t_delay = args.delay; 
     let mut current_line = 0;
+  
+let mut skip_anonymous = false;
+
+if t_service_lower == "ftp" || t_service_lower == "smb" {
+    println!("{} Vérification de la politique d'accès du serveur...", "[*]".cyan());
+    
+  
+    let is_anonymous = check_anonymous(&t_service_lower, &host_only, port_to_use).await;
+    
+    if is_anonymous {
+        println!("\n{}", "====================================================".yellow().bold());
+        println!("{} ATTENTION : Le serveur accepte les connexions ANONYMES !", "[!]".yellow().bold());
+        println!("{} (Le brute-force risque de générer des milliers de faux succès)", "[!]".yellow());
+        println!("{}", "====================================================".yellow().bold());
+        
+        print!("{} Voulez-vous IGNORER l'utilisateur 'anonymous' pour la suite ? (Y/n): ", "[?]".blue());
+        io::stdout().flush()?;
+        let mut ans = String::new();
+        io::stdin().read_line(&mut ans)?;
+        
+        if ans.trim().to_lowercase() != "n" {
+            skip_anonymous = true;
+            println!("{} L'utilisateur 'anonymous' sera filtré.", "[*]".green());
+        }
+    }
+}
+
+
 
     while let Ok(Some(line)) = lines.next_line().await {
         current_line += 1; 
@@ -458,7 +471,9 @@ if t_service_lower == "smb" {
             let parts: Vec<&str> = raw_line.splitn(2, ':').collect();
             (parts[0].to_string(), parts[1].to_string())
         } else { (raw_line.clone(), raw_line.clone()) };
-       
+       if skip_anonymous && u.to_lowercase() == "anonymous" {
+        continue; 
+    }
         let (t_u, t_p) = (u, p);
         let t_host = host_only.clone();
         let t_url = input_target.to_string(); 
@@ -471,15 +486,15 @@ if t_service_lower == "smb" {
         let t_cache_name = cache_file.clone(); 
 
         let permit = Arc::clone(&semaphore).acquire_owned().await?;
-
+        
         set.spawn(async move {
             let _permit = permit;
             if t_success.load(Ordering::SeqCst) { return; }
             if let Some(ms) = t_delay { tokio::time::sleep(Duration::from_millis(ms)).await; }
 
             let ok = match t_service.as_str() {
-                "ssh"  => attempt_ssh(&t_host, t_port, &t_u, &t_p).await,
-                "http" | "https" => attempt_http(&t_client, &t_url, t_port, &t_u, &t_p, &t_error, &t_uf, &t_pf).await,
+               "ssh" => attempt_ssh_async(&t_host, t_port, &t_u, &t_p).await,
+                "http" | "https" => attempt_http(&t_client, &t_url, t_port, &t_u, &t_p, &t_error, &t_uf, &t_pf).await ,
                 "ftp"  => {
                     let addr = format!("{}:{}", t_host, t_port);
                     if let Ok(Ok(mut ftp)) = timeout(Duration::from_secs(4), AsyncFtpStream::connect(addr)).await {
