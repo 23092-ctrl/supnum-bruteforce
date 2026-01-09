@@ -315,7 +315,7 @@ async fn attempt_http(
 
     if status.is_redirection() && !redirect_url.is_empty() {
         let red_low = redirect_url.to_lowercase();
-        let is_login_page = red_low == url.to_lowercase() || red_low.contains("/login");
+        let is_login_page = red_low == url.to_lowercase() || red_low.ends_with("/login");
         if is_login_page { return false; }
         return !error_found;
     }
