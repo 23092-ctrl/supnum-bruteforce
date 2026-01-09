@@ -20,7 +20,7 @@ pub struct SupArgs {
     #[arg( long, default_value_t = 10)]
     pub threads: usize,
 
-    #[arg(short, long)]
+    #[arg(long)]
     pub port: Option<u16>,
 
   
@@ -30,7 +30,7 @@ pub struct SupArgs {
     #[arg(short,long)]
     pub user: Option<String>,
 
-    #[arg(long)]
+    #[arg(short,long)]
     pub password: Option<String>,
 
     
