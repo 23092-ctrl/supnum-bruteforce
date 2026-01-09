@@ -21,6 +21,49 @@ use tokio::time::{timeout, Duration};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpStream;
 use std::io::{self, Write};
+async fn is_anonymous_login(service: &str, host: &str, port: u16, user: &str, pass: &str) -> bool {
+    let addr = format!("{}:{}", host, port);
+
+    match service {
+        "ftp" => {
+            // 1. Tenter la connexion avec l'utilisateur trouvé
+            if let Ok(Ok(mut ftp)) = timeout(Duration::from_secs(4), AsyncFtpStream::connect(&addr)).await {
+                if ftp.login(user, pass).await.is_ok() {
+                    // On récupère le répertoire actuel de l'utilisateur "réussi"
+                    let pwd_user = ftp.pwd().await.unwrap_or_default();
+                    let _ = ftp.quit().await;
+
+                    // 2. On compare avec un utilisateur totalement bidon
+                    if let Ok(Ok(mut ftp_fake)) = timeout(Duration::from_secs(4), AsyncFtpStream::connect(&addr)).await {
+                        if ftp_fake.login("ghost_user_99", "ghost_pass_99").await.is_ok() {
+                            let pwd_fake = ftp_fake.pwd().await.unwrap_or_default();
+                            let _ = ftp_fake.quit().await;
+                            
+                        
+                            return pwd_user == pwd_fake;
+                        }
+                    }
+                }
+            }
+        }
+        "smb" => {
+            
+            let user_pass_fake = "invalid_user%invalid_pass";
+            let share = format!("//{}//IPC$", host);
+
+            let out_fake = Command::new("smbclient")
+                .args([&share, "-U", user_pass_fake, "-c", "ls", "-t", "2"])
+                .output().await;
+
+            if let Ok(o) = out_fake {
+             
+                return o.status.success();
+            }
+        }
+        _ => return false,
+    }
+    false
+}
 async fn check_anonymous(service: &str, host: &str, port: u16) -> bool {
     match service {
         "ftp" => {
@@ -455,14 +498,14 @@ if t_service_lower == "ftp" || t_service_lower == "smb" {
 
 
 
-    while let Ok(Some(line)) = lines.next_line().await {
+   while let Ok(Some(line)) = lines.next_line().await {
         current_line += 1; 
         if current_line <= start_line { continue; }
         let raw_line = line.trim().to_string();
         if raw_line.is_empty() { continue; }
 
         if current_line % 100 == 0 {
-            let _ = std::fs::write(&cache_file, current_line.to_string()); // Correction Ownership &
+            let _ = std::fs::write(&cache_file, current_line.to_string());
         }
 
         let (u, p) = if let (Some(fu), Some(fp)) = (&args.user, &args.password) { (fu.clone(), fp.clone()) }
@@ -472,9 +515,7 @@ if t_service_lower == "ftp" || t_service_lower == "smb" {
             let parts: Vec<&str> = raw_line.splitn(2, ':').collect();
             (parts[0].to_string(), parts[1].to_string())
         } else { (raw_line.clone(), raw_line.clone()) };
-       if skip_anonymous && u.to_lowercase() == "anonymous" {
-        continue; 
-    }
+  
         let (t_u, t_p) = (u, p);
         let t_host = host_only.clone();
         let t_url = input_target.to_string(); 
@@ -485,6 +526,7 @@ if t_service_lower == "ftp" || t_service_lower == "smb" {
         let (t_uf, t_pf) = (u_field.clone(), p_field.clone());
         let t_port = port_to_use;
         let t_cache_name = cache_file.clone(); 
+        let skip_anon_flag = skip_anonymous; // Capturer la valeur pour le thread
 
         let permit = Arc::clone(&semaphore).acquire_owned().await?;
         
@@ -492,21 +534,43 @@ if t_service_lower == "ftp" || t_service_lower == "smb" {
             let _permit = permit;
             if t_success.load(Ordering::SeqCst) { return; }
             if let Some(ms) = t_delay { tokio::time::sleep(Duration::from_millis(ms)).await; }
-
-            let ok = match t_service.as_str() {
-               "ssh" => attempt_ssh_async(&t_host, t_port, &t_u, &t_p).await,
-                "http" | "https" => attempt_http(&t_client, &t_url, t_port, &t_u, &t_p, &t_error, &t_uf, &t_pf).await ,
-                "ftp"  => {
+  
+            // On utilise une seule variable is_ok pour tout le match
+            let is_ok = match t_service.as_str() {
+                "ssh" => attempt_ssh_async(&t_host, t_port, &t_u, &t_p).await,
+                "http" | "https" => attempt_http(&t_client, &t_url, t_port, &t_u, &t_p, &t_error, &t_uf, &t_pf).await,
+                "ftp" => {
                     let addr = format!("{}:{}", t_host, t_port);
+                    let mut login_success = false;
                     if let Ok(Ok(mut ftp)) = timeout(Duration::from_secs(4), AsyncFtpStream::connect(addr)).await {
-                        let res = ftp.login(&t_u, &t_p).await.is_ok();
-                        let _ = ftp.quit().await; res
-                    } else { false }
+                        if ftp.login(&t_u, &t_p).await.is_ok() {
+                            if skip_anon_flag {
+                                let pwd_user = ftp.pwd().await.unwrap_or_default();
+                                let _ = ftp.quit().await;
+                                if let Ok(Ok(mut ftp_f)) = timeout(Duration::from_secs(4), AsyncFtpStream::connect(format!("{}:{}", t_host, t_port))).await {
+                                    if ftp_f.login("ghost_99", "ghost_99").await.is_ok() {
+                                        if pwd_user == ftp_f.pwd().await.unwrap_or_default() { 
+                                            let _ = ftp_f.quit().await;
+                                            return; // C'est un anonyme, on sort du spawn
+                                        }
+                                    }
+                                }
+                            }
+                            login_success = true;
+                        }
+                    }
+                    login_success // On retourne le booléen pour le match
+                },
+                "smb" => {
+                    let mut smb_ok = attempt_smb(&t_host, &t_u, &t_p).await;
+                    if smb_ok && skip_anon_flag {
+                        if is_anonymous_login("smb", &t_host, t_port, &t_u, &t_p).await { return; }
+                    }
+                    smb_ok
                 },
                 "mysql"    => attempt_mysql(&t_host, t_port, &t_u, &t_p).await,
                 "postgres" => attempt_postgres(&t_host, t_port, &t_u, &t_p).await,
                 "mongodb"  => attempt_mongodb(&t_host, t_port, &t_u, &t_p).await,
-                "smb"      => attempt_smb(&t_host, &t_u, &t_p).await,
                 "smtp"     => attempt_smtp(&t_host, t_port, &t_u, &t_p).await,
                 "pop3"     => attempt_pop3(&t_host, t_port, &t_u, &t_p).await,
                 "imap"     => attempt_imap(&t_host, t_port, &t_u, &t_p).await,
@@ -516,11 +580,10 @@ if t_service_lower == "ftp" || t_service_lower == "smb" {
                 "vnc"      => attempt_vnc(&t_host, t_port, &t_p).await,
                 _ => false,
             };
-
-            if ok && !t_success.swap(true, Ordering::SeqCst) {
+   
+            if is_ok && !t_success.swap(true, Ordering::SeqCst) {
                 let _ = std::fs::remove_file(&t_cache_name); 
                 println!("\n\n{}", "====================================================".green().bold());
-              
                 println!("{} SUCCÈS TROUVÉ !", "[+]".green().bold());
                 println!("{} UTILISATEUR : {}", " >".cyan(), t_u.bright_white().bold());
                 println!("{} MOT DE PASSE : {}", " >".cyan(), t_p.bright_yellow().bold());
