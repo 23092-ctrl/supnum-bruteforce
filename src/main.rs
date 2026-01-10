@@ -316,7 +316,7 @@ async fn attempt_http(
     u_selector: &str,
     p_selector: &str,
 ) -> bool {
-    let url = if target.starts_with("http") {
+    let url = if target.starts_with("http:") {
         target.to_string()
     } else {
         let proto = if port == 443 { "https" } else { "http" };
