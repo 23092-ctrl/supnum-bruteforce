@@ -1,5 +1,4 @@
 use clap::Parser;
-
 #[derive(Parser, Debug)]
 #[command(name = "SupNum Bruteforce")]
 #[command(author = "Cheikh ELghadi")]
