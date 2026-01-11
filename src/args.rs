@@ -6,7 +6,7 @@ use clap::Parser;
 #[command(version = "1.0")]
 #[command(about = "Multi-service bruteforce tool with advanced HTTP selectors", long_about = None)]
 pub struct SupArgs {
-  
+
     #[arg(short, long)]
     pub target: String,
 
@@ -14,8 +14,14 @@ pub struct SupArgs {
     pub service: String,
 
     
-    #[arg(short, long)]
-    pub wordlist: String,
+  #[arg(
+        short, 
+        long, 
+        num_args = 1..=2, // <--- C'est ici le changement important
+        value_names = ["USERS", "PASSWORDS"],
+        help = "1 fichier (combo/split) ou 2 fichiers (matrix attack)"
+    )]
+    pub wordlist: Vec<String>,
 
     #[arg( long, default_value_t = 10)]
     pub threads: usize,
