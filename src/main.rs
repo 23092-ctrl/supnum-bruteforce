@@ -27,14 +27,14 @@ async fn is_anonymous_login(service: &str, host: &str, port: u16, user: &str, pa
 
     match service {
         "ftp" => {
-            // 1. Tenter la connexion avec l'utilisateur trouvé
+      
             if let Ok(Ok(mut ftp)) = timeout(Duration::from_secs(4), AsyncFtpStream::connect(&addr)).await {
                 if ftp.login(user, pass).await.is_ok() {
-                    // On récupère le répertoire actuel de l'utilisateur "réussi"
+             
                     let pwd_user = ftp.pwd().await.unwrap_or_default();
                     let _ = ftp.quit().await;
 
-                    // 2. On compare avec un utilisateur totalement bidon
+              
                     if let Ok(Ok(mut ftp_fake)) = timeout(Duration::from_secs(4), AsyncFtpStream::connect(&addr)).await {
                         if ftp_fake.login("ghost_user_99", "ghost_pass_99").await.is_ok() {
                             let pwd_fake = ftp_fake.pwd().await.unwrap_or_default();
@@ -238,7 +238,22 @@ async fn attempt_postgres(host: &str, port: u16, user: &str, pass: &str) -> bool
     let url = format!("postgres://{}:{}@{}:{}/postgres", user, pass, host, port);
     timeout(Duration::from_secs(3), sqlx::PgPool::connect(&url)).await.is_ok()
 }
+async fn attempt_redis(target: &str, port: u16, pass: &str) -> bool {
+    let url = format!("redis://{}:{}", target, port);
+    let client = match redis::Client::open(url) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
 
+    match client.get_connection_with_timeout(std::time::Duration::from_secs(3)) {
+        Ok(mut con) => {
+          
+            let cmd = redis::cmd("AUTH").arg(pass).query::<bool>(&mut con);
+            cmd.unwrap_or(false)
+        },
+        Err(_) => false,
+    }
+}
 async fn attempt_mongodb(host: &str, port: u16, user: &str, pass: &str) -> bool {
     let uri = format!("mongodb://{}:{}@{}:{}/", user, pass, host, port);
     if let Ok(opt) = ClientOptions::parse(uri).await {
@@ -250,13 +265,26 @@ async fn attempt_mongodb(host: &str, port: u16, user: &str, pass: &str) -> bool 
 }
 
 async fn attempt_ldap(host: &str, port: u16, user: &str, pass: &str) -> bool {
-    let addr = format!("ldap://{}:{}", host, port);
+    // Déterminer le protocole selon le port (636 est le port LDAPS standard)
+    let proto = if port == 636 { "ldaps" } else { "ldap" };
+    let addr = format!("{}://{}:{}", proto, host, port);
+    
     let u = user.to_string();
     let p = pass.to_string();
+
     tokio::task::spawn_blocking(move || {
-        use ldap3::LdapConn;
-        if let Ok(mut ldap) = LdapConn::new(&addr) {
-            return ldap.simple_bind(&u, &p).is_ok();
+        use ldap3::{LdapConn, LdapConnSettings};
+        
+        
+        let settings = LdapConnSettings::new()
+            .set_conn_timeout(std::time::Duration::from_secs(5));
+
+        
+        if let Ok(mut ldap) = LdapConn::with_settings(settings, &addr) {
+            let res = ldap.simple_bind(&u, &p);
+            // On s'assure de fermer proprement la connexion
+            let _ = ldap.unbind(); 
+            return res.is_ok();
         }
         false
     }).await.unwrap_or(false)
@@ -335,7 +363,6 @@ async fn get_fake_body(
 
     res.text().await.unwrap_or_default()
 }
-
 async fn attempt_http(
     client: &reqwest::Client,
     target: &str,
@@ -345,8 +372,9 @@ async fn attempt_http(
     error_msg: &Option<String>,
     u_selector: &str,
     p_selector: &str,
-    fake_body: &str, // Passé en paramètre maintenant
+    fake_body: &str,
 ) -> bool {
+    
     let url = if target.starts_with("http:") || target.starts_with("https:") {
         target.to_string()
     } else {
@@ -356,12 +384,18 @@ async fn attempt_http(
 
     let params = [(u_selector.trim(), user.trim()), (p_selector.trim(), pass.trim())];
 
-  
+    let res_post = client
+        .post(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Connection", "keep-alive")
+        .header("Upgrade-Insecure-Requests", "1")
+        .header("Referer", &url)
+        .form(&params)
+        .send()
+        .await;
 
-    // Tentative POST d'abord
-    let res_post = client.post(&url).form(&params).send().await;
-
-    // Si POST échoue, on tente GET
     let res = match res_post {
         Ok(r) => r,
         Err(_) => {
@@ -369,7 +403,17 @@ async fn attempt_http(
                 Ok(u) => u,
                 Err(_) => return false,
             };
-            match client.get(full_url).send().await {
+            match client
+                .get(full_url)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("Connection", "keep-alive")
+                .header("Upgrade-Insecure-Requests", "1")
+                .header("Referer", &url)
+                .send()
+                .await
+            {
                 Ok(r) => r,
                 Err(_) => return false,
             }
@@ -392,33 +436,32 @@ async fn attempt_http(
 
     let body = res.text().await.unwrap_or_default();
     let body_low = body.to_lowercase();
-
+    let u_pattern = format!("name=\"{}\"", u_selector.to_lowercase());
+    let p_pattern = format!("name=\"{}\"", p_selector.to_lowercase());
     let error_found = if let Some(msg) = error_msg {
         body_low.contains(&msg.to_lowercase())
     } else {
-        false
-    };
+      body_low.contains(&u_pattern) || body_low.contains(&p_pattern) 
+    }; //messag derreure par defaut=iputs
 
     if content_type.contains("application/json") {
         if status.is_success() && !error_found {
             let success_indicators =
                 ["\"success\":true", "\"authenticated\":true", "\"token\"", "\"access_token\""];
             if success_indicators.iter().any(|&s| body_low.contains(s)) {
-                return true && body != fake_body;
+                return body != fake_body;
             }
             if error_msg.is_some() && !error_found {
-                return true && body != fake_body;
+                return body != fake_body;
             }
         }
         return false;
     }
 
-    let u_pattern = format!("name=\"{}\"", u_selector.to_lowercase());
-    let p_pattern = format!("name=\"{}\"", p_selector.to_lowercase());
-    let inputs_present = body_low.contains(&u_pattern) || body_low.contains(&p_pattern);
+    
+    // let inputs_present = body_low.contains(&u_pattern) || body_low.contains(&p_pattern);
 
     if status.is_redirection() && !redirect_url.is_empty() {
-        // Normalisation inline
         let mut red_low = redirect_url.trim().to_lowercase();
         if red_low.ends_with('/') { red_low.pop(); }
         if let Ok(parsed) = reqwest::Url::parse(&red_low) {
@@ -433,21 +476,19 @@ async fn attempt_http(
             if clean_url.ends_with('/') { clean_url.pop(); }
         }
 
-        let is_login_page = red_low == clean_url;
-        if is_login_page {
-            return false;
+        if red_low == clean_url && error_found {
+            return false ;
         }
         return !error_found && body != fake_body;
     }
 
-    if status.is_success() && !error_found && !inputs_present {
-        return true && body != fake_body;
+    if status.is_success() && !error_found  {
+        return body != fake_body;
+        
     }
 
-    !inputs_present && !error_found && !status.is_server_error() && body != fake_body
+    !status.is_server_error() && body != fake_body
 }
-
-
 
 async fn attempt_vnc(host: &str, port: u16, _pass: &str) -> bool { 
     let addr = format!("{}:{}", host, port);
@@ -484,13 +525,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.service.to_lowercase()
     };
 
-    let port_to_use = args.port.or(parsed_url.port()).unwrap_or(match t_service_lower.as_str() {
-        "ssh" => 22, "ftp" => 21, "smb" => 445, "mysql" => 3306,
-        "smtp" => 25, "pop3" => 110, "imap" => 143, "https" => 443,
-        "rdp" => 3389, "telnet" => 23, "mongodb" => 27017, "postgres" => 5432,
-        "vnc" => 5900,
-        _ => 80,
-    });
+  let port_to_use = args.port.or(parsed_url.port()).unwrap_or(match t_service_lower.as_str() {
+
+"ssh" => 22, "ftp" => 21, "smb" => 445, "mysql" => 3306,
+
+"smtp" => 25, "pop3" => 110, "imap" => 143, "https" => 443,
+
+"rdp" => 3389, "telnet" => 23, "mongodb" => 27017, "postgres" => 5432,
+
+"vnc" => 5900, "ldap" => 389,
+    "ldaps" => 636, "redis" => 6379,
+
+_ => 80,
+
+});
 
     let detected = detect_service(&host_only, port_to_use).await;
     if detected == "closed" {
@@ -652,16 +700,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if ok && skip_anon_flag && is_anonymous_login("smb", &t_host, t_port, &t_u, &t_p).await { return; }
                         ok
                     },
+
                     "mysql"    => attempt_mysql(&t_host, t_port, &t_u, &t_p).await,
                     "postgres" => attempt_postgres(&t_host, t_port, &t_u, &t_p).await,
                     "mongodb"  => attempt_mongodb(&t_host, t_port, &t_u, &t_p).await,
+                    
                     "smtp"     => attempt_smtp(&t_host, t_port, &t_u, &t_p).await,
                     "pop3"     => attempt_pop3(&t_host, t_port, &t_u, &t_p).await,
                     "imap"     => attempt_imap(&t_host, t_port, &t_u, &t_p).await,
-                    "ldap"     => attempt_ldap(&t_host, t_port, &t_u, &t_p).await,
+                    "ldap" |"ldaps"    => attempt_ldap(&t_host, t_port, &t_u, &t_p).await,
                     "telnet"   => attempt_telnet(&t_host, t_port, &t_u, &t_p).await,
                     "rdp"      => attempt_rdp(&t_host, t_port, &t_u, &t_p).await,
                     "vnc"      => attempt_vnc(&t_host, t_port, &t_p).await,
+                    "redis" => attempt_redis(&t_host, t_port, &t_p).await,
                     _ => false,
                 };
 
