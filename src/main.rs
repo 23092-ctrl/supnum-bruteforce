@@ -372,10 +372,11 @@ async fn attempt_http(
     error_msg: &Option<String>,
     u_selector: &str,
     p_selector: &str,
-    fake_body: &str,
+    _fake_body: &str, 
 ) -> bool {
     
-    let url = if target.starts_with("http:") || target.starts_with("https:") {
+   
+    let url = if target.starts_with("http") {
         target.to_string()
     } else {
         let proto = if port == 443 { "https" } else { "http" };
@@ -384,36 +385,26 @@ async fn attempt_http(
 
     let params = [(u_selector.trim(), user.trim()), (p_selector.trim(), pass.trim())];
 
-    let res_post = client
-        .post(&url)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
-        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Connection", "keep-alive")
-        .header("Upgrade-Insecure-Requests", "1")
+  
+    let res_post = client.post(&url)
+        .header("User-Agent", "Mozilla/5.0 (Hydra/SupNum) Firefox/122.0")
         .header("Referer", &url)
         .form(&params)
         .send()
         .await;
 
+ 
     let res = match res_post {
         Ok(r) => r,
         Err(_) => {
+        
             let full_url = match reqwest::Url::parse_with_params(&url, &params) {
                 Ok(u) => u,
                 Err(_) => return false,
             };
-            match client
-                .get(full_url)
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
-                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-                .header("Accept-Language", "en-US,en;q=0.9")
-                .header("Connection", "keep-alive")
-                .header("Upgrade-Insecure-Requests", "1")
-                .header("Referer", &url)
-                .send()
-                .await
-            {
+            match client.get(full_url)
+                .header("User-Agent", "Mozilla/5.0 (Hydra/SupNum) Firefox/122.0")
+                .send().await {
                 Ok(r) => r,
                 Err(_) => return false,
             }
@@ -421,75 +412,74 @@ async fn attempt_http(
     };
 
     let status = res.status();
-    let content_type = res
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_lowercase();
-    let redirect_url = res
-        .headers()
-        .get("location")
-        .and_then(|l| l.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-
-    let body = res.text().await.unwrap_or_default();
-    let body_low = body.to_lowercase();
-    let u_pattern = format!("name=\"{}\"", u_selector.to_lowercase());
-    let p_pattern = format!("name=\"{}\"", p_selector.to_lowercase());
-    let error_found = if let Some(msg) = error_msg {
-        body_low.contains(&msg.to_lowercase())
-    } else {
-      body_low.contains(&u_pattern) || body_low.contains(&p_pattern) 
-    }; //messag derreure par defaut=iputs
-
-    if content_type.contains("application/json") {
-        if status.is_success() && !error_found {
-            let success_indicators =
-                ["\"success\":true", "\"authenticated\":true", "\"token\"", "\"access_token\""];
-            if success_indicators.iter().any(|&s| body_low.contains(s)) {
-                return body != fake_body;
-            }
-            if error_msg.is_some() && !error_found {
-                return body != fake_body;
-            }
-        }
+    
+    
+    if status.is_server_error() {
         return false;
     }
 
+  
+    let redirect_url = res.headers()
+        .get("location")
+        .and_then(|l| l.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let body = res.text().await.unwrap_or_default();
+    let body_low = body.to_lowercase();
+
     
-    // let inputs_present = body_low.contains(&u_pattern) || body_low.contains(&p_pattern);
 
-    if status.is_redirection() && !redirect_url.is_empty() {
-        let mut red_low = redirect_url.trim().to_lowercase();
-        if red_low.ends_with('/') { red_low.pop(); }
-        if let Ok(parsed) = reqwest::Url::parse(&red_low) {
-            red_low = format!("{}://{}{}", parsed.scheme(), parsed.host_str().unwrap_or(""), parsed.path());
-            if red_low.ends_with('/') { red_low.pop(); }
+    let mut is_failure = false;
+
+  
+    if let Some(msg) = error_msg {
+        let m = msg.to_lowercase();
+      
+        if body_low.contains(&m) || redirect_url.contains(&m) {
+            is_failure = true;
         }
-
-        let mut clean_url = url.trim().to_lowercase();
-        if clean_url.ends_with('/') { clean_url.pop(); }
-        if let Ok(parsed) = reqwest::Url::parse(&clean_url) {
-            clean_url = format!("{}://{}{}", parsed.scheme(), parsed.host_str().unwrap_or(""), parsed.path());
-            if clean_url.ends_with('/') { clean_url.pop(); }
-        }
-
-        if red_low == clean_url && error_found {
-            return false ;
-        }
-        return !error_found && body != fake_body;
-    }
-
-    if status.is_success() && !error_found  {
-        return body != fake_body;
+    } else {
         
+        let u_pattern = format!("name=\"{}\"", u_selector.to_lowercase());
+        let p_pattern = format!("name=\"{}\"", p_selector.to_lowercase());
+        
+        if body_low.contains(&u_pattern) || body_low.contains(&p_pattern) || body_low.contains("type=\"password\"") {
+            is_failure = true;
+        }
     }
 
-    !status.is_server_error() && body != fake_body
-}
 
+    if is_failure {
+        return false;
+    }
+
+   
+    if body.trim().starts_with('{') {
+        let success_indicators = ["\"success\":true", "\"token\"", "access_token"];
+        if success_indicators.iter().any(|&s| body_low.contains(s)) {
+            return true;
+        }
+    
+        return status.is_success();
+    }
+
+  
+    if status.is_redirection() {
+        
+        if redirect_url.contains("login") || redirect_url.contains(u_selector) {
+            return false;
+        }
+        return true;
+    }
+
+    
+    if status.is_success() {
+        return true;
+    }
+
+    false
+}
 async fn attempt_vnc(host: &str, port: u16, _pass: &str) -> bool { 
     let addr = format!("{}:{}", host, port);
     let mut stream = match timeout(Duration::from_secs(3), TcpStream::connect(&addr)).await {
@@ -631,11 +621,11 @@ _ => 80,
         let raw1 = line1.trim().to_string();
         if raw1.is_empty() { continue; }
 
-        // Préparation des paires (User, Pass)
+  
         let mut pairs = Vec::new();
 
         if let Some(pass_path) = &pass_file_path {
-            // --- CAS A : DEUX FICHIERS (Matrix Attack) ---
+        
             let f_pass = tokio::fs::File::open(pass_path).await?;
             let mut pass_inner = tokio::io::BufReader::new(f_pass).lines();
             while let Ok(Some(line2)) = pass_inner.next_line().await {
@@ -643,7 +633,7 @@ _ => 80,
                 if !raw2.is_empty() { pairs.push((raw1.clone(), raw2)); }
             }
         } else {
-            // --- CAS B : UN SEUL FICHIER (Logic Originale) ---
+            
             current_line += 1;
             if current_line <= start_line { continue; }
             if current_line % 100 == 0 { let _ = std::fs::write(&cache_file, current_line.to_string()); }
