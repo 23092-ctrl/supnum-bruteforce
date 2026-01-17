@@ -309,6 +309,7 @@ async fn attempt_mongodb(host: &str, port: u16, user: &str, pass: &str, auth_sou
                 
                 let result = timeout(Duration::from_secs(2), c.list_database_names(None, None)).await;
                 if let Ok(Ok(_)) = result {
+                       println!("[*] Base de donne        : {}", db);
                     return true; 
                 }
             }
