@@ -259,7 +259,7 @@ async fn attempt_postgres(host: &str, port: u16, user: &str, pass: &str, db_list
         match res {
             Ok(Ok(_conn)) => {
               
-                println!("[*] Base de donne        : {}", clean_db);
+                println!("[*] Base de donnees  : {}", clean_db.bright_green().bold());
                 return true;
             },
             Ok(Err(e)) => {
@@ -309,7 +309,7 @@ async fn attempt_mongodb(host: &str, port: u16, user: &str, pass: &str, auth_sou
                 
                 let result = timeout(Duration::from_secs(2), c.list_database_names(None, None)).await;
                 if let Ok(Ok(_)) = result {
-                       println!("[*] Base de donne        : {}", db);
+                       println!("[*] Base de donnees  : {}", db.bright_green().bold());
                     return true; 
                 }
             }
