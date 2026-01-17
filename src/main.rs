@@ -8,7 +8,7 @@ use tokio::sync::Semaphore;
 // use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt};
 use colored::*;
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT, REFERER, ACCEPT, ACCEPT_LANGUAGE};
+//use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT, REFERER, ACCEPT, ACCEPT_LANGUAGE};
 use russh::*;
 use russh_keys::*;
 use async_trait::async_trait;
@@ -238,12 +238,12 @@ use sqlx::postgres::PgConnectOptions;
 use sqlx::ConnectOptions;
 
 async fn attempt_postgres(host: &str, port: u16, user: &str, pass: &str, db_list: &[String]) -> bool {
-    // Nettoyage systématique
+   
     let clean_user = user.trim();
     let clean_pass = pass.trim();
 
     for db in db_list {
-        let clean_db = db.trim(); // Très important si db_list vient d'un fichier
+        let clean_db = db.trim(); 
         
         let opts = PgConnectOptions::new()
             .host(host)
@@ -253,7 +253,7 @@ async fn attempt_postgres(host: &str, port: u16, user: &str, pass: &str, db_list
             .database(clean_db) 
             .disable_statement_logging();
 
-        
+       
         let res = timeout(Duration::from_secs(5), opts.connect()).await;
 
         match res {
@@ -263,7 +263,7 @@ async fn attempt_postgres(host: &str, port: u16, user: &str, pass: &str, db_list
                 return true;
             },
             Ok(Err(e)) => {
-               
+              
                 continue;
             }
             _ => continue,
