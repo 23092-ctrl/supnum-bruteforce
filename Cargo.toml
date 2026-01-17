@@ -20,6 +20,8 @@ tokio-native-tls = "0.3"
 rand = "0.8"
 mongodb = "2.0"
 sqlx = { version = "0.7", features = ["mysql", "postgres", "runtime-tokio-native-tls"] }
+urlencoding = "2.1"
+
 ldap3 = "0.11"
 [profile.release]
 opt-level = 3
