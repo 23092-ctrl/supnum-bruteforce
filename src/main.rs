@@ -131,15 +131,15 @@ async fn attempt_ssh_async(host: &str, port: u16, user: &str, pass: &str) -> boo
     let sh = Client;
     let addr = format!("{}:{}", host, port);
 
-    // 1. Connexion avec timeout strict
+    
     let connect_res = tokio::time::timeout(
-        std::time::Duration::from_secs(4), // Temps pour ouvrir le port et Handshake
+        std::time::Duration::from_secs(4), 
         client::connect(config, addr, sh)
     ).await;
 
     match connect_res {
         Ok(Ok(mut session)) => {
-            // 2. Authentification avec un timeout dédié
+           
             let auth_res = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 session.authenticate_password(user, pass)
@@ -147,7 +147,7 @@ async fn attempt_ssh_async(host: &str, port: u16, user: &str, pass: &str) -> boo
 
             match auth_res {
                 Ok(Ok(success)) => {
-                    // 3. Fermeture propre (très important pour l'efficacité)
+               
                     let _ = session.disconnect(Disconnect::ByApplication, "", "");
                     success
                 },
@@ -234,9 +234,42 @@ async fn attempt_mysql(host: &str, port: u16, user: &str, pass: &str) -> bool {
     }
 }
 
-async fn attempt_postgres(host: &str, port: u16, user: &str, pass: &str) -> bool {
-    let url = format!("postgres://{}:{}@{}:{}/postgres", user, pass, host, port);
-    timeout(Duration::from_secs(3), sqlx::PgPool::connect(&url)).await.is_ok()
+use sqlx::postgres::PgConnectOptions;
+use sqlx::ConnectOptions;
+
+async fn attempt_postgres(host: &str, port: u16, user: &str, pass: &str, db_list: &[String]) -> bool {
+    // Nettoyage systématique
+    let clean_user = user.trim();
+    let clean_pass = pass.trim();
+
+    for db in db_list {
+        let clean_db = db.trim(); // Très important si db_list vient d'un fichier
+        
+        let opts = PgConnectOptions::new()
+            .host(host)
+            .port(port)
+            .username(clean_user)
+            .password(clean_pass)
+            .database(clean_db) 
+            .disable_statement_logging();
+
+        
+        let res = timeout(Duration::from_secs(5), opts.connect()).await;
+
+        match res {
+            Ok(Ok(_conn)) => {
+              
+                println!("[*] Base de donne        : {}", clean_db);
+                return true;
+            },
+            Ok(Err(e)) => {
+               
+                continue;
+            }
+            _ => continue,
+        }
+    }
+    false
 }
 async fn attempt_redis(target: &str, port: u16, pass: &str) -> bool {
     let url = format!("redis://{}:{}", target, port);
@@ -254,18 +287,38 @@ async fn attempt_redis(target: &str, port: u16, pass: &str) -> bool {
         Err(_) => false,
     }
 }
-async fn attempt_mongodb(host: &str, port: u16, user: &str, pass: &str) -> bool {
-    let uri = format!("mongodb://{}:{}@{}:{}/", user, pass, host, port);
-    if let Ok(opt) = ClientOptions::parse(uri).await {
-        if let Ok(c) = MongoClient::with_options(opt) { 
-            return timeout(Duration::from_secs(3), c.list_database_names(None, None)).await.is_ok(); 
+use urlencoding::encode; 
+
+async fn attempt_mongodb(host: &str, port: u16, user: &str, pass: &str, auth_sources: &[String]) -> bool {
+    let encoded_user = encode(user);
+    let encoded_pass = encode(pass);
+
+  
+    for db in auth_sources {
+        let uri = format!(
+            "mongodb://{}:{}@{}:{}/?authSource={}", 
+            encoded_user, encoded_pass, host, port, db
+        );
+
+        if let Ok(mut opt) = ClientOptions::parse(&uri).await {
+            opt.connect_timeout = Some(Duration::from_secs(1));
+            opt.server_selection_timeout = Some(Duration::from_secs(1));
+            opt.direct_connection = Some(true);
+
+            if let Ok(c) = MongoClient::with_options(opt) { 
+                
+                let result = timeout(Duration::from_secs(2), c.list_database_names(None, None)).await;
+                if let Ok(Ok(_)) = result {
+                    return true; 
+                }
+            }
         }
     }
     false
 }
 
 async fn attempt_ldap(host: &str, port: u16, user: &str, pass: &str) -> bool {
-    // Déterminer le protocole selon le port (636 est le port LDAPS standard)
+
     let proto = if port == 636 { "ldaps" } else { "ldap" };
     let addr = format!("{}://{}:{}", proto, host, port);
     
@@ -282,7 +335,7 @@ async fn attempt_ldap(host: &str, port: u16, user: &str, pass: &str) -> bool {
         
         if let Ok(mut ldap) = LdapConn::with_settings(settings, &addr) {
             let res = ldap.simple_bind(&u, &p);
-            // On s'assure de fermer proprement la connexion
+          
             let _ = ldap.unbind(); 
             return res.is_ok();
         }
@@ -347,7 +400,7 @@ async fn get_fake_body(
         format!("{}://{}:{}", proto, target, port)
     };
 
-    // Identifiants bidons pour générer une page d'erreur type
+  
     let fake_user = "non_existent_user_xyz_123";
     let fake_pass = "non_existent_pass_xyz_123";
 
@@ -515,6 +568,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.service.to_lowercase()
     };
 
+let auth_sources: Vec<String> = if let Some(path) = &args.bdlist {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|s| s.trim().to_string())
+        .collect()
+} else {
+    vec!["admin".to_string()] 
+};
   let port_to_use = args.port.or(parsed_url.port()).unwrap_or(match t_service_lower.as_str() {
 
 "ssh" => 22, "ftp" => 21, "smb" => 445, "mysql" => 3306,
@@ -535,6 +597,7 @@ _ => 80,
         println!("{} Port {} fermé sur {}.", "[!]".red(), port_to_use, host_only);
         return Ok(());
     } 
+
 
     let success_found = Arc::new(AtomicBool::new(false));
     let semaphore = Arc::new(Semaphore::new(args.threads));
@@ -666,6 +729,7 @@ _ => 80,
 
             let permit = Arc::clone(&semaphore).acquire_owned().await?;
             let t_fake = fake_body.clone();
+            let dbs_for_thread = auth_sources.clone();
             set.spawn(async move {
                 let _permit = permit;
                 if t_success.load(Ordering::SeqCst) { return; }
@@ -692,9 +756,9 @@ _ => 80,
                     },
 
                     "mysql"    => attempt_mysql(&t_host, t_port, &t_u, &t_p).await,
-                    "postgres" => attempt_postgres(&t_host, t_port, &t_u, &t_p).await,
-                    "mongodb"  => attempt_mongodb(&t_host, t_port, &t_u, &t_p).await,
+                    "postgres" => attempt_postgres(&t_host, t_port, &t_u, &t_p, &dbs_for_thread).await,
                     
+                  "mongodb" => attempt_mongodb(&t_host, t_port, &t_u, &t_p, &dbs_for_thread).await,
                     "smtp"     => attempt_smtp(&t_host, t_port, &t_u, &t_p).await,
                     "pop3"     => attempt_pop3(&t_host, t_port, &t_u, &t_p).await,
                     "imap"     => attempt_imap(&t_host, t_port, &t_u, &t_p).await,
