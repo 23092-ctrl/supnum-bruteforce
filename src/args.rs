@@ -13,7 +13,8 @@ pub struct SupArgs {
     #[arg(short, long, default_value = "http")]
     pub service: String,
 
-    
+  #[arg(short = 'b', long = "bdlist")]
+    pub bdlist: Option<String>,
   #[arg(
         short, 
         long, 
